@@ -2,9 +2,16 @@
 
 #![forbid(unsafe_code)]
 
+mod daemon;
+
 use anyhow::Result;
 use clap::{Parser, Subcommand};
+use std::net::SocketAddr;
 use tracing_subscriber::EnvFilter;
+
+/// Default TCP port for USB/IP. Matches the IANA registration and the
+/// hard-coded default in the Linux `usbipd` and `usbip` utilities.
+const DEFAULT_PORT: u16 = 3240;
 
 #[derive(Debug, Parser)]
 #[command(name = "usbipd", version, about = "macOS USB/IP server daemon")]
@@ -17,6 +24,16 @@ struct Cli {
 enum Cmd {
     /// List local USB devices available for sharing.
     List,
+    /// Run the USB/IP server.
+    ///
+    /// At this stage the daemon only answers `OP_REQ_DEVLIST` (i.e. it makes
+    /// `usbip list -r <host>` work). Attaching a device for actual transfers
+    /// is not yet implemented.
+    Daemon {
+        /// Address and port to listen on.
+        #[arg(long, default_value_t = SocketAddr::from(([127, 0, 0, 1], DEFAULT_PORT)))]
+        listen: SocketAddr,
+    },
 }
 
 fn main() -> Result<()> {
@@ -29,6 +46,7 @@ fn main() -> Result<()> {
     let cli = Cli::parse();
     match cli.cmd {
         Cmd::List => list(),
+        Cmd::Daemon { listen } => daemon::run(listen),
     }
 }
 
