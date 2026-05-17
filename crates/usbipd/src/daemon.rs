@@ -24,8 +24,9 @@ use tokio::task::AbortHandle;
 use tracing::{debug, info, warn};
 use usbip_proto::{
     CmdSubmit, CmdUnlink, OP_REQ_DEVLIST, OP_REQ_IMPORT, OpHeader, RetSubmit, URB_HEADER_SIZE,
-    USBIP_CMD_SUBMIT, USBIP_CMD_UNLINK, USBIP_DIR_IN, UrbHeader, decode_req_import_busid,
-    encode_rep_import_err, encode_rep_import_ok, write_ret_submit, write_ret_unlink,
+    USBIP_CMD_SUBMIT, USBIP_CMD_UNLINK, USBIP_DIR_IN, USBIP_VERSION, UrbHeader,
+    decode_req_import_busid, encode_rep_import_err, encode_rep_import_ok, write_ret_submit,
+    write_ret_unlink,
 };
 use usbip_server::{Reply, encode_rep_devlist, handle_op, to_exported};
 
@@ -91,6 +92,16 @@ async fn handle_client(mut stream: TcpStream, peer: SocketAddr) -> Result<()> {
         .with_context(|| format!("read op header from {peer}"))?;
     let header = OpHeader::decode(&header_buf).context("decode op header")?;
     debug!(%peer, version = format!("0x{:04x}", header.version), code = format!("0x{:04x}", header.code), "op header");
+
+    if header.version != USBIP_VERSION {
+        warn!(
+            %peer,
+            got = format!("0x{:04x}", header.version),
+            expected = format!("0x{USBIP_VERSION:04x}"),
+            "rejecting op with unsupported USB/IP version"
+        );
+        return Ok(());
+    }
 
     match header.code {
         OP_REQ_DEVLIST => handle_devlist(stream, peer).await,

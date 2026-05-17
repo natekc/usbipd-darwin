@@ -32,13 +32,17 @@ pub fn handle_op(header: OpHeader, devices: &[UsbDevice]) -> Result<Reply, Proto
 
 /// Encode an `OP_REP_DEVLIST` payload: op-header + u32 device count +
 /// one [`ExportedDevice`] record per device.
+///
+/// Hubs (`bDeviceClass == 0x09`) are filtered out because the Linux usbip
+/// client never wants to (and on macOS can't) attach to a hub interface.
 #[must_use]
 pub fn encode_rep_devlist(devices: &[UsbDevice]) -> Vec<u8> {
-    let mut out = Vec::with_capacity(8 + 4 + devices.len() * 320);
+    let exported: Vec<_> = devices.iter().filter(|d| d.class != 0x09).collect();
+    let mut out = Vec::with_capacity(8 + 4 + exported.len() * 320);
     OpHeader::new(OP_REP_DEVLIST).encode(&mut out);
-    let n = u32::try_from(devices.len()).unwrap_or(u32::MAX);
+    let n = u32::try_from(exported.len()).unwrap_or(u32::MAX);
     out.extend_from_slice(&n.to_be_bytes());
-    for d in devices {
+    for d in exported {
         to_exported(d).encode(&mut out);
     }
     out
@@ -142,5 +146,18 @@ mod tests {
         let bytes = encode_rep_devlist(&[]);
         assert_eq!(bytes.len(), 12);
         assert_eq!(&bytes[8..12], &[0, 0, 0, 0]);
+    }
+
+    #[test]
+    fn devlist_filters_hubs() {
+        let mut hub = sample_device();
+        hub.busid = "01-0".into();
+        hub.class = 0x09;
+        let dev = sample_device();
+        let bytes = encode_rep_devlist(&[hub, dev]);
+        // count == 1 even though we passed 2 entries
+        assert_eq!(&bytes[8..12], &[0, 0, 0, 1]);
+        let (decoded, _) = usbip_proto::ExportedDevice::decode(&bytes[12..]).unwrap();
+        assert_eq!(decoded.busid, "01-1");
     }
 }
