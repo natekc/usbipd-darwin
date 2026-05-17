@@ -3,6 +3,7 @@
 #![forbid(unsafe_code)]
 
 mod daemon;
+mod sudoers;
 
 use anyhow::{Context, Result, anyhow};
 use clap::{Parser, Subcommand};
@@ -76,6 +77,54 @@ enum Cmd {
         #[arg(long)]
         allow_public: bool,
     },
+    /// Print a `NOPASSWD:NOSETENV` sudoers fragment for an exact
+    /// `usbipd daemon ...` invocation.
+    ///
+    /// Modeled on `limactl sudoers` / `socket_vmnet` in lima-vm/lima:
+    /// the generated rule whitelists the absolute path of this binary
+    /// plus the exact daemon argument list you pass here, scoped to a
+    /// chosen Unix group. After installing the fragment, members of
+    /// that group can run `sudo usbipd daemon ...` (with the same
+    /// args) without a password.
+    ///
+    /// Why root? macOS denies non-root processes exclusive access to
+    /// USB interfaces that are already bound to a kernel driver
+    /// (`kIOReturnExclusiveAccess`, 0xe00002c5), which kills bulk
+    /// transfers to e.g. mass-storage devices. Run as root to break
+    /// the kernel driver's claim.
+    ///
+    /// Typical use:
+    ///
+    ///     usbipd sudoers --listen 127.0.0.1:3240 --allow 0781:5530 \
+    ///         | sudo tee /etc/sudoers.d/usbipd
+    ///     sudo usbipd daemon --listen 127.0.0.1:3240 --allow 0781:5530
+    Sudoers {
+        /// Unix group whose members get the NOPASSWD rule. The
+        /// default `admin` matches the local-admin group on macOS
+        /// and mirrors the convention used by `limactl sudoers`.
+        #[arg(long, default_value = "admin")]
+        group: String,
+
+        /// Override the binary path baked into the rule. Defaults to
+        /// the absolute path of the currently-running `usbipd`.
+        /// Useful when generating the fragment on one host for
+        /// deployment on another, or when the binary is reached via
+        /// a symlink you'd rather pin.
+        #[arg(long, value_name = "PATH")]
+        binary: Option<PathBuf>,
+
+        /// Daemon arguments to whitelist, exactly as you would pass
+        /// them to `usbipd daemon`. Separate from `usbipd sudoers`'s
+        /// own flags with `--`, e.g.
+        /// `usbipd sudoers --group admin -- --listen 127.0.0.1:3240`.
+        #[arg(
+            trailing_var_arg = true,
+            allow_hyphen_values = true,
+            value_name = "DAEMON_ARGS"
+        )]
+        daemon_args: Vec<String>,
+    },
+
     /// Release a force-captured device back to macOS (root only).
     ///
     /// Manual escape hatch for the case where the daemon was killed
@@ -134,9 +183,41 @@ fn main() -> Result<()> {
             })
             .context("daemon")
         }
+        Cmd::Sudoers {
+            group,
+            binary,
+            daemon_args,
+        } => emit_sudoers(&group, binary, &daemon_args),
         #[cfg(target_os = "macos")]
         Cmd::ReleaseCapture { busid } => release_capture(&busid),
     }
+}
+
+fn emit_sudoers(group: &str, binary: Option<PathBuf>, daemon_args: &[String]) -> Result<()> {
+    // Default to `daemon` with no extra args if the caller passed
+    // nothing. Picking a sensible default keeps the smoke-test
+    // invocation (`usbipd sudoers`) useful, while passing args
+    // through verbatim lets the user pin a tight rule.
+    let owned: Vec<String> = if daemon_args.is_empty() {
+        vec!["daemon".to_string()]
+    } else {
+        let mut v = Vec::with_capacity(daemon_args.len() + 1);
+        if daemon_args.first().map(String::as_str) != Some("daemon") {
+            v.push("daemon".to_string());
+        }
+        v.extend(daemon_args.iter().cloned());
+        v
+    };
+    let args: Vec<&str> = owned.iter().map(String::as_str).collect();
+    let bin = binary.unwrap_or_else(sudoers::self_path);
+    let fragment = sudoers::render(&sudoers::Spec {
+        group,
+        binary: &bin,
+        args: &args,
+    })
+    .map_err(|e| anyhow!("render sudoers fragment: {e}"))?;
+    print!("{fragment}");
+    Ok(())
 }
 
 #[cfg(target_os = "macos")]
