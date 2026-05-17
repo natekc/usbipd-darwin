@@ -9,5 +9,10 @@
 #![forbid(unsafe_code)]
 
 pub mod error;
+pub mod op;
 
 pub use error::ProtoError;
+pub use op::{
+    ExportedDevice, ExportedInterface, OP_REP_DEVLIST, OP_REP_IMPORT, OP_REQ_DEVLIST,
+    OP_REQ_IMPORT, OpHeader, USBIP_VERSION,
+};
