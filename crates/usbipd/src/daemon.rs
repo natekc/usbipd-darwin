@@ -789,10 +789,10 @@ fn encode_rep_devlist(devices: &[UsbDevice]) -> Vec<u8> {
 
 /// Convert the host-side [`UsbDevice`] into the wire-format
 /// [`ExportedDevice`]. The path field is synthesized as
-/// `/usbipd-mac/<busid>`.
+/// `/usbipd-darwin/<busid>`.
 fn to_exported(d: &UsbDevice) -> ExportedDevice {
     ExportedDevice {
-        path: format!("/usbipd-mac/{}", d.busid),
+        path: format!("/usbipd-darwin/{}", d.busid),
         busid: d.busid.clone(),
         busnum: d.busnum,
         devnum: d.devnum,
@@ -903,6 +903,6 @@ mod tests {
         let (decoded, _) = usbip_proto::ExportedDevice::decode(&bytes[12..]).unwrap();
         assert_eq!(decoded.id_vendor, 0x1050);
         assert_eq!(decoded.id_product, 0x0407);
-        assert!(decoded.path.starts_with("/usbipd-mac/"));
+        assert!(decoded.path.starts_with("/usbipd-darwin/"));
     }
 }

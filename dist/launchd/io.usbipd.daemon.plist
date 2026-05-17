@@ -1,6 +1,6 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <!--
-    LaunchDaemon for usbipd-mac.
+    LaunchDaemon for usbipd-darwin.
 
     Installed at:  /Library/LaunchDaemons/io.usbipd.daemon.plist
     Owned by:      root:wheel

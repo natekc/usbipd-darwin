@@ -1,10 +1,10 @@
-# usbipd-mac
+# usbipd-darwin
 
 A macOS USB/IP server implementation in Rust, intended for use by [Lima](https://github.com/lima-vm/lima) and other VMMs that need to expose host USB devices to Linux guests.
 
 > **Status:** MVP-5 — full protocol implementation plus IOKit force-capture, so Linux clients can `usbip list -r`, `usbip attach`, and use any USB device class end-to-end (mass storage, HID, CDC, printer, audio, …). Verified with a USB HID keyboard: both interfaces bind to `usbhid` on the guest, full input event chain works.
 
-## Why another `usbipd-mac`?
+## Why another macOS USB/IP daemon?
 
 [`beriberikix/usbipd-mac`](https://github.com/beriberikix/usbipd-mac) is the existing Swift implementation. It requires an Apple-approved DriverKit System Extension entitlement to claim USB devices, and has been blocked on that approval since August 2025.
 

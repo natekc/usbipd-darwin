@@ -48,7 +48,7 @@ fn sample_ret_submit() -> RetSubmit {
 
 fn sample_exported_device() -> ExportedDevice {
     ExportedDevice {
-        path: "/usbipd-mac/01-1".into(),
+        path: "/usbipd-darwin/01-1".into(),
         busid: "01-1".into(),
         busnum: 1,
         devnum: 1,

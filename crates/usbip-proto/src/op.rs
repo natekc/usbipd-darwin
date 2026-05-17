@@ -329,7 +329,7 @@ mod tests {
         // Modeled on the real SanDisk Cruzer we enumerate (0781:5530),
         // a mass-storage device with one interface (class 0x08).
         let d = ExportedDevice {
-            path: "/usbipd-mac/01-1".into(),
+            path: "/usbipd-darwin/01-1".into(),
             busid: "01-1".into(),
             busnum: 1,
             devnum: 1,

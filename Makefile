@@ -1,4 +1,4 @@
-# usbipd-mac — release / install Makefile
+# usbipd-darwin — release / install Makefile
 #
 # `make build`          — cargo build --release
 # `make codesign`       — sign the release binary with hardened runtime
