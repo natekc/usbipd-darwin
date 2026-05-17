@@ -1,4 +1,5 @@
-//! Tokio TCP adapter around [`usbip_server`] and the URB session loop.
+//! Tokio adapter (TCP or unix-domain socket) around the USB/IP wire
+//! protocol, and the URB session loop.
 //!
 //! Connection lifecycle:
 //! 1. Read an 8-byte op header.
@@ -8,28 +9,15 @@
 //! 4. URB loop: read 48-byte URB headers and dispatch `CMD_SUBMIT` /
 //!    `CMD_UNLINK` until the client disconnects.
 //!
-//! ## Security model
-//!
-//! USB/IP has **no authentication or transport encryption**. Anyone who can
-//! reach the listener can enumerate and steal any allow-listed device. Two
-//! defenses are exposed through [`DaemonConfig`]:
-//!
-//! * `listen` defaults to `127.0.0.1`. Binding to a routable address
-//!   requires the caller to acknowledge that with `--allow-public` (in the
-//!   CLI) or by setting [`DaemonConfig::allow_public_bind`].
-//! * `policy` filters which devices the daemon will even mention. If a
-//!   client requests a non-allow-listed busid via `OP_REQ_IMPORT` the
-//!   request is rejected and the device is never opened, never captured.
-//!
-//! In addition, each successfully-imported device is locked to its
-//! connecting client: a second concurrent `OP_REQ_IMPORT` for the same
-//! busid is refused so two clients can't tear-and-share the same device.
+//! Security knobs (loopback bind, allow-list, unix-socket transport) are
+//! documented in the project README; this module just enforces them.
 
 use anyhow::{Context, Result, anyhow};
 use host_mac::{OpenedDevice, SetupPacket, UsbDevice};
 use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::net::SocketAddr;
+use std::os::unix::fs::PermissionsExt as _;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -40,23 +28,17 @@ use tokio::sync::{Mutex as AsyncMutex, Semaphore};
 use tokio::task::AbortHandle;
 use tracing::{debug, info, warn};
 use usbip_proto::{
-    CmdSubmit, CmdUnlink, OP_REQ_DEVLIST, OP_REQ_IMPORT, OpHeader, RetSubmit, URB_HEADER_SIZE,
-    USBIP_CMD_SUBMIT, USBIP_CMD_UNLINK, USBIP_DIR_IN, USBIP_VERSION, UrbHeader,
-    decode_req_import_busid, encode_rep_import_err, encode_rep_import_ok, write_ret_submit,
-    write_ret_unlink,
+    CmdSubmit, CmdUnlink, ExportedDevice, ExportedInterface, OP_REP_DEVLIST, OP_REQ_DEVLIST,
+    OP_REQ_IMPORT, OpHeader, RetSubmit, URB_HEADER_SIZE, USBIP_CMD_SUBMIT, USBIP_CMD_UNLINK,
+    USBIP_DIR_IN, USBIP_VERSION, UrbHeader, decode_req_import_busid, encode_rep_import_err,
+    encode_rep_import_ok, write_ret_submit, write_ret_unlink,
 };
-use usbip_server::{Reply, encode_rep_devlist, handle_op, to_exported};
 
 /// Boxed trait object for the read half of a session.
 type BoxRead = Box<dyn AsyncRead + Send + Unpin>;
 /// Boxed trait object for the write half of a session, shared across the
 /// `urb_loop` task and every spawned per-URB task behind a tokio mutex.
 type SharedWriter = Arc<AsyncMutex<Box<dyn AsyncWrite + Send + Unpin>>>;
-
-/// Per-URB transfer timeout. Long enough for slow bulk operations on large
-/// mass-storage SCSI commands; short enough that a wedged device will free
-/// the connection within a minute.
-const URB_TIMEOUT: Duration = Duration::from_secs(60);
 
 /// Per-connection cap on in-flight `CMD_SUBMIT` URBs. Bounds the daemon's
 /// blocking-thread footprint when a misbehaving client floods submits
@@ -99,12 +81,12 @@ impl AccessPolicy {
         }
     }
 
-    /// Filter a list of devices by this policy. Used to build the
+    /// Keep only devices this policy permits. Used to build the
     /// `OP_REP_DEVLIST` body so the client never sees devices it isn't
     /// allowed to import.
-    fn filter<'a>(&self, devices: &'a [UsbDevice]) -> Vec<&'a UsbDevice> {
+    fn filter(&self, devices: Vec<UsbDevice>) -> Vec<UsbDevice> {
         devices
-            .iter()
+            .into_iter()
             .filter(|d| self.permits(d.vendor_id, d.product_id))
             .collect()
     }
@@ -119,16 +101,6 @@ pub struct DaemonConfig {
     /// loopback returns an error. Set to `true` from the CLI flag
     /// `--allow-public` after the user has acknowledged the consequence.
     pub allow_public_bind: bool,
-}
-
-impl Default for DaemonConfig {
-    fn default() -> Self {
-        Self {
-            endpoint: Endpoint::Tcp(SocketAddr::from(([127, 0, 0, 1], 3240))),
-            policy: AccessPolicy::default(),
-            allow_public_bind: false,
-        }
-    }
 }
 
 /// Where the daemon accepts connections from. TCP for the canonical
@@ -150,25 +122,15 @@ impl fmt::Display for Endpoint {
     }
 }
 
-/// Human-readable label for the remote side of a session. We don't
-/// otherwise care about IP vs uid; this is just used for log messages.
-#[derive(Debug, Clone)]
-struct Peer(String);
-
-impl fmt::Display for Peer {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(&self.0)
-    }
-}
-
 /// Shared state held for the lifetime of the listener and threaded
 /// through every spawned task.
 struct DaemonState {
     policy: AccessPolicy,
     /// Devices currently held open by a client, keyed by busid. The
-    /// value is the peer address for diagnostics. Used to refuse a
-    /// second concurrent import of the same device.
-    attached: std::sync::Mutex<HashMap<String, Peer>>,
+    /// value is a human-readable peer label (`"tcp:addr"` or
+    /// `"unix:uid=N,pid=M"`) for diagnostics. Used to refuse a second
+    /// concurrent import of the same device.
+    attached: std::sync::Mutex<HashMap<String, String>>,
 }
 
 impl DaemonState {
@@ -182,12 +144,12 @@ impl DaemonState {
     /// Try to claim `busid` for `peer`. Returns `Some(guard)` on success,
     /// `None` if another client already has it open. The guard releases
     /// the slot on drop.
-    fn try_attach(self: &Arc<Self>, busid: &str, peer: &Peer) -> Option<AttachGuard> {
+    fn try_attach(self: &Arc<Self>, busid: &str, peer: &str) -> Option<AttachGuard> {
         let mut map = self.attached.lock().expect("attached map poisoned");
         if map.contains_key(busid) {
             return None;
         }
-        map.insert(busid.to_owned(), peer.clone());
+        map.insert(busid.to_owned(), peer.to_owned());
         Some(AttachGuard {
             state: Arc::clone(self),
             busid: busid.to_owned(),
@@ -272,7 +234,8 @@ async fn serve(config: DaemonConfig) -> Result<()> {
             // Tighten permissions: only the owning user should be able to
             // connect. Filesystem permissions are the only access control
             // a unix-socket transport offers.
-            if let Err(e) = std::fs::set_permissions(path, unix_mode(0o600))
+            if let Err(e) =
+                std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))
             {
                 warn!(error = %e, "could not chmod 0600 on socket; access will fall back to umask");
             }
@@ -290,16 +253,7 @@ async fn accept_loop_tcp(
         tokio::select! {
             res = listener.accept() => match res {
                 Ok((stream, addr)) => {
-                    let peer = Peer(format!("tcp:{addr}"));
-                    let state = Arc::clone(state);
-                    tokio::spawn(async move {
-                        let (r, w) = stream.into_split();
-                        let reader: BoxRead = Box::new(r);
-                        let writer: SharedWriter = Arc::new(AsyncMutex::new(Box::new(w)));
-                        if let Err(e) = handle_session(reader, writer, peer.clone(), state).await {
-                            warn!(%peer, error = %e, "client session ended with error");
-                        }
-                    });
+                    spawn_session(Arc::clone(state), format!("tcp:{addr}"), stream.into_split());
                 }
                 Err(e) => warn!(error = %e, "accept failed"),
             },
@@ -321,16 +275,7 @@ async fn accept_loop_unix(
         tokio::select! {
             res = listener.accept() => match res {
                 Ok((stream, _)) => {
-                    let peer = unix_peer_label(&stream);
-                    let state = Arc::clone(state);
-                    tokio::spawn(async move {
-                        let (r, w) = stream.into_split();
-                        let reader: BoxRead = Box::new(r);
-                        let writer: SharedWriter = Arc::new(AsyncMutex::new(Box::new(w)));
-                        if let Err(e) = handle_session(reader, writer, peer.clone(), state).await {
-                            warn!(%peer, error = %e, "client session ended with error");
-                        }
-                    });
+                    spawn_session(Arc::clone(state), unix_peer_label(&stream), stream.into_split());
                 }
                 Err(e) => warn!(error = %e, "accept failed"),
             },
@@ -344,15 +289,31 @@ async fn accept_loop_unix(
     result
 }
 
-fn unix_peer_label(stream: &UnixStream) -> Peer {
+/// Wrap an accepted (read, write) pair in the trait-object types the
+/// session handler needs and spawn it. Factored out to keep the two
+/// accept loops a one-liner so the only thing that differs between
+/// them is the peer label format.
+fn spawn_session<R, W>(state: Arc<DaemonState>, peer: String, halves: (R, W))
+where
+    R: AsyncRead + Send + Unpin + 'static,
+    W: AsyncWrite + Send + Unpin + 'static,
+{
+    let (r, w) = halves;
+    let reader: BoxRead = Box::new(r);
+    let writer: SharedWriter = Arc::new(AsyncMutex::new(Box::new(w)));
+    tokio::spawn(async move {
+        let peer_for_log = peer.clone();
+        if let Err(e) = handle_session(reader, writer, peer, state).await {
+            warn!(peer = %peer_for_log, error = %e, "client session ended with error");
+        }
+    });
+}
+
+fn unix_peer_label(stream: &UnixStream) -> String {
     if let Ok(cred) = stream.peer_cred() {
-        Peer(format!(
-            "unix:uid={},pid={}",
-            cred.uid(),
-            cred.pid().unwrap_or(0)
-        ))
+        format!("unix:uid={},pid={}", cred.uid(), cred.pid().unwrap_or(0))
     } else {
-        Peer("unix:unknown".into())
+        "unix:unknown".into()
     }
 }
 
@@ -360,15 +321,10 @@ fn is_loopback(addr: &SocketAddr) -> bool {
     addr.ip().is_loopback()
 }
 
-fn unix_mode(bits: u32) -> std::fs::Permissions {
-    use std::os::unix::fs::PermissionsExt;
-    std::fs::Permissions::from_mode(bits)
-}
-
 async fn handle_session(
     mut reader: BoxRead,
     writer: SharedWriter,
-    peer: Peer,
+    peer: String,
     state: Arc<DaemonState>,
 ) -> Result<()> {
     debug!(%peer, "client connected");
@@ -393,18 +349,8 @@ async fn handle_session(
     match header.code {
         OP_REQ_DEVLIST => handle_devlist(&writer, &peer, &state).await,
         OP_REQ_IMPORT => handle_import(reader, writer, peer, &state).await,
-        _ => {
-            let devices = host_mac::list_devices().context("enumerate USB devices")?;
-            let owned: Vec<UsbDevice> =
-                state.policy.filter(&devices).into_iter().cloned().collect();
-            match handle_op(header, &owned)? {
-                Reply::Bytes(bytes) => {
-                    writer.lock().await.write_all(&bytes).await?;
-                }
-                Reply::Unsupported(code) => {
-                    warn!(%peer, code = format!("0x{code:04x}"), "unsupported op code; closing");
-                }
-            }
+        code => {
+            warn!(%peer, code = format!("0x{code:04x}"), "unsupported op code; closing");
             Ok(())
         }
     }
@@ -412,11 +358,12 @@ async fn handle_session(
 
 async fn handle_devlist(
     writer: &SharedWriter,
-    peer: &Peer,
+    peer: &str,
     state: &Arc<DaemonState>,
 ) -> Result<()> {
     let devices = host_mac::list_devices().context("enumerate USB devices")?;
-    let filtered: Vec<UsbDevice> = state.policy.filter(&devices).into_iter().cloned().collect();
+    let total = devices.len();
+    let filtered = state.policy.filter(devices);
     let bytes = encode_rep_devlist(&filtered);
     {
         let mut w = writer.lock().await;
@@ -425,14 +372,14 @@ async fn handle_devlist(
             .with_context(|| format!("write devlist to {peer}"))?;
         w.flush().await.ok();
     }
-    debug!(%peer, bytes = bytes.len(), exported = filtered.len(), total = devices.len(), "devlist sent");
+    debug!(%peer, bytes = bytes.len(), exported = filtered.len(), total, "devlist sent");
     Ok(())
 }
 
 async fn handle_import(
     mut reader: BoxRead,
     writer: SharedWriter,
-    peer: Peer,
+    peer: String,
     state: &Arc<DaemonState>,
 ) -> Result<()> {
     let mut busid_buf = [0u8; 32];
@@ -532,7 +479,7 @@ async fn send_import_err(writer: &SharedWriter) -> Result<()> {
 async fn urb_loop(
     mut reader: BoxRead,
     writer: SharedWriter,
-    peer: Peer,
+    peer: String,
     desc: UsbDevice,
     opened: Arc<OpenedDevice>,
 ) -> Result<()> {
@@ -541,31 +488,17 @@ async fn urb_loop(
         Arc::new(std::sync::Mutex::new(HashMap::new()));
     let permits = Arc::new(Semaphore::new(MAX_INFLIGHT_URBS));
 
-    // Hotplug watchdog: poll for the device every few seconds. If it
-    // disappears we want to close the session promptly rather than wait
-    // for the client to notice via the next transfer error (which may
-    // never come for an idle attached device, e.g. a keyboard).
-    let unplug_notify = Arc::new(tokio::sync::Notify::new());
-    let _watchdog = HotplugWatchdog::spawn(desc.busid.clone(), Arc::clone(&unplug_notify));
-
     let mut header_buf = [0u8; URB_HEADER_SIZE];
     let result: Result<()> = loop {
-        // EOF here means clean client disconnect.
-        let read_fut = reader.read_exact(&mut header_buf);
-        let unplug_fut = unplug_notify.notified();
-        tokio::pin!(read_fut, unplug_fut);
-        tokio::select! {
-            r = &mut read_fut => if let Err(e) = r {
-                if e.kind() == std::io::ErrorKind::UnexpectedEof {
-                    debug!(%peer, "client disconnected");
-                    break Ok(());
-                }
-                break Err(anyhow::Error::from(e).context("read URB header"));
-            },
-            () = &mut unplug_fut => {
-                warn!(%peer, busid = %desc.busid, "device unplugged; closing session");
+        // EOF here means clean client disconnect. A genuine unplug
+        // surfaces here too via the next transfer error on either
+        // side; we deliberately don't run a separate hotplug poller.
+        if let Err(e) = reader.read_exact(&mut header_buf).await {
+            if e.kind() == std::io::ErrorKind::UnexpectedEof {
+                debug!(%peer, "client disconnected");
                 break Ok(());
             }
+            break Err(anyhow::Error::from(e).context("read URB header"));
         }
         let basic = match UrbHeader::decode(&header_buf[0..UrbHeader::SIZE]) {
             Ok(b) => b,
@@ -692,7 +625,7 @@ async fn handle_cmd_unlink(
     writer: &SharedWriter,
     opened: &Arc<OpenedDevice>,
     inflight: &Arc<std::sync::Mutex<HashMap<u32, Inflight>>>,
-    peer: &Peer,
+    peer: &str,
     basic: UrbHeader,
     header_buf: &[u8; URB_HEADER_SIZE],
 ) -> Result<()> {
@@ -747,54 +680,6 @@ struct Inflight {
     cancelled: Arc<AtomicBool>,
 }
 
-/// Periodic poller that fires a `Notify` when an imported busid
-/// disappears from `host_mac::list_devices()` (i.e. physical unplug
-/// or `kextload` re-attach by macOS).
-///
-/// Polling cadence is intentionally coarse (every `POLL_INTERVAL`):
-/// the URB read path already surfaces I/O errors on the device
-/// immediately, so this is just a backstop for the idle-attached case
-/// (HID keyboards, paused mass storage, etc.).
-struct HotplugWatchdog {
-    task: tokio::task::JoinHandle<()>,
-}
-
-impl HotplugWatchdog {
-    const POLL_INTERVAL: Duration = Duration::from_secs(3);
-
-    fn spawn(busid: String, notify: Arc<tokio::sync::Notify>) -> Self {
-        let task = tokio::spawn(async move {
-            let mut tick = tokio::time::interval(Self::POLL_INTERVAL);
-            tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-            // Skip the immediate first tick — we just verified the
-            // device exists by opening it.
-            tick.tick().await;
-            loop {
-                tick.tick().await;
-                let busid = busid.clone();
-                let present = tokio::task::spawn_blocking(move || {
-                    host_mac::list_devices()
-                        .map(|ds| ds.iter().any(|d| d.busid == busid))
-                        .unwrap_or(true) // on enumeration failure, assume present
-                })
-                .await
-                .unwrap_or(true);
-                if !present {
-                    notify.notify_waiters();
-                    return;
-                }
-            }
-        });
-        Self { task }
-    }
-}
-
-impl Drop for HotplugWatchdog {
-    fn drop(&mut self) {
-        self.task.abort();
-    }
-}
-
 async fn run_submit(
     opened: Arc<OpenedDevice>,
     writer: SharedWriter,
@@ -808,18 +693,24 @@ async fn run_submit(
     let ep = basic.ep;
     let seqnum = basic.seqnum;
 
+    // Long enough for slow bulk operations on large mass-storage SCSI
+    // commands; short enough that a wedged device frees the connection
+    // within a minute. Not user-configurable yet; revisit if real
+    // workloads need it.
+    let timeout = Duration::from_secs(60);
+
     // Run the actual nusb call on a blocking thread.
     let result = match tokio::task::spawn_blocking(
         move || -> Result<(usize, Vec<u8>), host_mac::HostError> {
             if ep == 0 {
                 let setup = SetupPacket::from_bytes(cmd.setup);
-                let data = opened.control_transfer(setup, &out_payload, URB_TIMEOUT)?;
+                let data = opened.control_transfer(setup, &out_payload, timeout)?;
                 let len = if dir_in { data.len() } else { out_payload.len() };
                 Ok((len, data))
             } else {
                 let ep_addr =
                     u8::try_from(ep & 0xF).unwrap_or(0) | if dir_in { 0x80 } else { 0x00 };
-                let r = opened.data_transfer(ep_addr, tbl, &out_payload, URB_TIMEOUT)?;
+                let r = opened.data_transfer(ep_addr, tbl, &out_payload, timeout)?;
                 Ok((r.actual_length, r.data))
             }
         },
@@ -874,6 +765,58 @@ async fn run_submit(
     }
 }
 
+// ---------------------------------------------------------------------
+// Wire-format encoders for the bits the daemon writes directly. These
+// used to live in a separate `usbip-server` crate "for transport-
+// agnosticism" but in practice only the daemon ever called them.
+
+/// Encode an `OP_REP_DEVLIST` payload: op-header + u32 device count +
+/// one [`ExportedDevice`] record per device.
+///
+/// Hubs (`bDeviceClass == 0x09`) are filtered out because the Linux
+/// usbip client never wants to attach to a hub interface.
+fn encode_rep_devlist(devices: &[UsbDevice]) -> Vec<u8> {
+    let exported: Vec<_> = devices.iter().filter(|d| d.class != 0x09).collect();
+    let mut out = Vec::with_capacity(8 + 4 + exported.len() * 320);
+    OpHeader::new(OP_REP_DEVLIST).encode(&mut out);
+    let n = u32::try_from(exported.len()).unwrap_or(u32::MAX);
+    out.extend_from_slice(&n.to_be_bytes());
+    for d in exported {
+        to_exported(d).encode(&mut out);
+    }
+    out
+}
+
+/// Convert the host-side [`UsbDevice`] into the wire-format
+/// [`ExportedDevice`]. The path field is synthesized as
+/// `/usbipd-mac/<busid>`.
+fn to_exported(d: &UsbDevice) -> ExportedDevice {
+    ExportedDevice {
+        path: format!("/usbipd-mac/{}", d.busid),
+        busid: d.busid.clone(),
+        busnum: d.busnum,
+        devnum: d.devnum,
+        speed: d.speed,
+        id_vendor: d.vendor_id,
+        id_product: d.product_id,
+        bcd_device: d.bcd_device,
+        b_device_class: d.class,
+        b_device_subclass: d.subclass,
+        b_device_protocol: d.protocol,
+        b_configuration_value: d.configuration_value,
+        b_num_configurations: d.num_configurations,
+        interfaces: d
+            .interfaces
+            .iter()
+            .map(|i| ExportedInterface {
+                class: i.class,
+                subclass: i.subclass,
+                protocol: i.protocol,
+            })
+            .collect(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -903,14 +846,14 @@ mod tests {
     fn policy_deny_all_rejects_everything() {
         let p = AccessPolicy::DenyAll;
         assert!(!p.permits(0x1050, 0x0407));
-        assert!(p.filter(&[dev(0x1050, 0x0407)]).is_empty());
+        assert!(p.filter(vec![dev(0x1050, 0x0407)]).is_empty());
     }
 
     #[test]
     fn policy_allow_all_admits_everything() {
         let p = AccessPolicy::AllowAll;
         assert!(p.permits(0x1050, 0x0407));
-        assert_eq!(p.filter(&[dev(0x1050, 0x0407), dev(1, 2)]).len(), 2);
+        assert_eq!(p.filter(vec![dev(0x1050, 0x0407), dev(1, 2)]).len(), 2);
     }
 
     #[test]
@@ -919,8 +862,7 @@ mod tests {
         assert!(p.permits(0x1050, 0x0407));
         assert!(!p.permits(0x1050, 0x0408));
         assert!(!p.permits(0x1051, 0x0407));
-        let devs = [dev(0x1050, 0x0407), dev(1, 2)];
-        let filtered = p.filter(&devs);
+        let filtered = p.filter(vec![dev(0x1050, 0x0407), dev(1, 2)]);
         assert_eq!(filtered.len(), 1);
         assert_eq!(filtered[0].vendor_id, 0x1050);
     }
@@ -928,17 +870,17 @@ mod tests {
     #[test]
     fn try_attach_is_mutually_exclusive_per_busid() {
         let state = Arc::new(DaemonState::new(AccessPolicy::AllowAll));
-        let peer1 = Peer("tcp:127.0.0.1:1111".into());
-        let peer2 = Peer("tcp:127.0.0.1:2222".into());
-        let g1 = state.try_attach("01-1", &peer1);
+        let peer1 = "tcp:127.0.0.1:1111";
+        let peer2 = "tcp:127.0.0.1:2222";
+        let g1 = state.try_attach("01-1", peer1);
         assert!(g1.is_some(), "first client should win");
-        let g2 = state.try_attach("01-1", &peer2);
+        let g2 = state.try_attach("01-1", peer2);
         assert!(g2.is_none(), "second concurrent client should be refused");
         // A *different* busid should still succeed.
-        let g3 = state.try_attach("01-2", &peer2);
+        let g3 = state.try_attach("01-2", peer2);
         assert!(g3.is_some());
         drop(g1);
-        let g4 = state.try_attach("01-1", &peer2);
+        let g4 = state.try_attach("01-1", peer2);
         assert!(g4.is_some(), "should be re-attachable after first guard dropped");
     }
 
@@ -948,5 +890,19 @@ mod tests {
         assert!(is_loopback(&"[::1]:3240".parse().unwrap()));
         assert!(!is_loopback(&"0.0.0.0:3240".parse().unwrap()));
         assert!(!is_loopback(&"192.168.1.10:3240".parse().unwrap()));
+    }
+
+    #[test]
+    fn devlist_filters_hubs_and_encodes_record() {
+        let mut hub = dev(0x1d6b, 0x0002);
+        hub.class = 0x09; // hub
+        let kbd = dev(0x1050, 0x0407);
+        let bytes = encode_rep_devlist(&[hub, kbd]);
+        // op-header (8) + count (4) = 12. Count must be 1 (hub filtered).
+        assert_eq!(&bytes[8..12], &[0, 0, 0, 1]);
+        let (decoded, _) = usbip_proto::ExportedDevice::decode(&bytes[12..]).unwrap();
+        assert_eq!(decoded.id_vendor, 0x1050);
+        assert_eq!(decoded.id_product, 0x0407);
+        assert!(decoded.path.starts_with("/usbipd-mac/"));
     }
 }

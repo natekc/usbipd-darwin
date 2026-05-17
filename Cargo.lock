@@ -847,16 +847,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "usbip-server"
-version = "0.0.1"
-dependencies = [
- "host-mac",
- "thiserror",
- "tracing",
- "usbip-proto",
-]
-
-[[package]]
 name = "usbipd"
 version = "0.0.1"
 dependencies = [
@@ -869,7 +859,6 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "usbip-proto",
- "usbip-server",
 ]
 
 [[package]]
