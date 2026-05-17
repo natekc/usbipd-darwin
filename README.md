@@ -2,7 +2,7 @@
 
 A macOS USB/IP server implementation in Rust, intended for use by [Lima](https://github.com/lima-vm/lima) and other VMMs that need to expose host USB devices to Linux guests.
 
-> **Status:** MVP-4 — full protocol implementation; Linux clients can `usbip list -r`, `usbip attach`, and enumerate the device end-to-end. Bulk/interrupt transfers are blocked on macOS auto-binding kernel drivers to recognized device classes (see *Known limitations* below). MVP-5 will address this with IOKit force-capture.
+> **Status:** MVP-5 — full protocol implementation plus IOKit force-capture, so Linux clients can `usbip list -r`, `usbip attach`, and use any USB device class end-to-end (mass storage, HID, CDC, printer, audio, …). Verified with a USB HID keyboard: both interfaces bind to `usbhid` on the guest, full input event chain works.
 
 ## Why another `usbipd-mac`?
 
@@ -48,15 +48,41 @@ sudo usbip list -r <mac-host>
 sudo usbip attach -r <mac-host> -b <busid>
 ```
 
-## Known limitations (current state)
+## Running with force-capture (root)
 
-The daemon currently implements the full USB/IP protocol — `OP_REQ_DEVLIST`, `OP_REQ_IMPORT`, `USBIP_CMD_SUBMIT` (control / bulk / interrupt), `USBIP_CMD_UNLINK` — but data-stage transfers (bulk / interrupt) are subject to macOS's kernel-driver auto-bind:
+When the daemon runs as root, it automatically force-detaches macOS kernel
+drivers from any device a client imports, using
+[`USBDeviceReEnumerate`](https://developer.apple.com/documentation/iokit/iousbdeviceinterface500/usbdevicereenumerate)
+with `kUSBReEnumerateCaptureDeviceMask`. This is the same mechanism
+Apple's own developer tooling uses to claim devices from in-kernel drivers,
+and it does **not** require any Apple entitlement (the DriverKit
+entitlement that blocks `beriberikix/usbipd-mac` is for a different code
+path — DriverKit driver bundles).
 
-- **Control transfers (endpoint 0) always work**. The Linux guest successfully reads the device, configuration, and string descriptors over USB/IP, and the device is fully enumerated in the guest kernel.
-- **Bulk and interrupt transfers fail with `kIOReturnExclusiveAccess` (0xE00002C5)** for any device whose interface class is recognized by macOS (mass storage, HID, CDC, printer, audio, etc.). macOS's in-kernel `IOUSBHost` framework binds the appropriate class driver before any userspace process can claim the interface, and `nusb 0.2.3` does not implement driver detach on macOS.
-- **Vendor-specific (class 0xFF) interfaces are not auto-bound** and should work today, although not yet tested.
+When the daemon receives `SIGINT` (or a client disconnects cleanly), the
+capture is automatically released so macOS rebinds its built-in drivers.
+If the daemon is killed ungracefully (`SIGKILL`, panic), the capture
+persists across process death — the device stays detached from macOS
+kernel drivers until either a physical unplug or:
 
-**MVP-5 plan:** call `IOUSBHostInterface::open(IOUSBHostObjectInitOptionsCaptureDevice)` from `IOUSBHost.framework` via a thin `unsafe` IOKit FFI layer (gated behind a non-default crate feature, and requiring root). This is force-capture and does not require any Apple entitlement — the DriverKit entitlement that blocks `beriberikix/usbipd-mac` is for a different code path (DriverKit driver bundles). Until then, MVP-4 is useful as a "device enumeration over USB/IP" service and as a fully tested protocol stack for the URB layer.
+```sh
+sudo usbipd release-capture <busid>
+```
+
+When running as a non-root user, the daemon still works but only control
+transfers on endpoint 0 are guaranteed to succeed; bulk/interrupt
+transfers will fail with `kIOReturnExclusiveAccess` for any device whose
+interfaces macOS auto-binds.
+
+The canonical deployment pattern (matching what Lima already does for
+[`socket_vmnet`](https://github.com/lima-vm/socket_vmnet)) is a narrow
+`sudoers.d` rule:
+
+```
+# /etc/sudoers.d/usbipd
+%admin ALL=(ALL) NOPASSWD: /usr/local/bin/usbipd daemon *
+%admin ALL=(ALL) NOPASSWD: /usr/local/bin/usbipd release-capture *
+```
 
 ## License
 

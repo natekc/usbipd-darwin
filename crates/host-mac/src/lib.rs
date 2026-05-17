@@ -2,8 +2,14 @@
 //!
 //! Wraps [`nusb`] to provide device enumeration and (eventually) device claim
 //! / URB submission against `IOKit` / `IOUSBHost`.
+//!
+//! Unsafe code is forbidden everywhere except the [`capture`] module, which
+//! does the `IOKit` FFI required to force-detach macOS kernel drivers.
 
-#![forbid(unsafe_code)]
+#![deny(unsafe_code)]
+
+#[cfg(target_os = "macos")]
+pub mod capture;
 
 use std::collections::HashMap;
 use std::sync::Mutex;
@@ -14,6 +20,7 @@ use nusb::transfer::{
     Bulk, ControlIn, ControlOut, ControlType, In, Interrupt, Out, Recipient, TransferError,
 };
 use thiserror::Error;
+use tracing::{debug, info, warn};
 
 #[derive(Debug, Error)]
 pub enum HostError {
@@ -29,6 +36,11 @@ pub enum HostError {
     UnsupportedTransfer(u8),
     #[error("invalid setup packet")]
     InvalidSetup,
+    #[cfg(target_os = "macos")]
+    #[error("force-capture failed: {0}")]
+    Capture(#[from] capture::CaptureError),
+    #[error("timed out waiting for device to re-enumerate")]
+    ReenumerateTimeout,
 }
 
 /// A single USB interface from the device's active configuration.
@@ -143,6 +155,29 @@ fn speed_to_usbip(speed: Option<nusb::Speed>) -> u32 {
     }
 }
 
+/// Release a previously force-captured device by USB/IP busid.
+///
+/// macOS only. No-op (returns `Ok`) when not running as root or when no
+/// device with the given busid exists. Useful as a manual escape hatch
+/// after an ungraceful daemon shutdown (e.g. `SIGKILL`), since the
+/// capture flag persists across process death until either a release
+/// re-enumerate or a physical unplug.
+#[cfg(target_os = "macos")]
+pub fn release_capture(busid: &str) -> Result<(), HostError> {
+    if !capture::is_root() {
+        return Ok(());
+    }
+    let Some(info) = nusb::list_devices()
+        .wait()?
+        .find(|i| format_busid(i) == busid)
+    else {
+        return Ok(());
+    };
+    let reg_id = info.registry_entry_id();
+    capture::reenumerate_release(reg_id)?;
+    Ok(())
+}
+
 /// Format a USB/IP-style busid from a nusb `DeviceInfo`.
 ///
 /// USB/IP uses `<bus>-<port>[.<port>...]`. We reuse the host bus id as the
@@ -225,13 +260,65 @@ enum EpKind {
 /// An opened USB device with lazily-claimed interfaces and lazily-opened
 /// endpoints. All transfer methods are blocking; callers should invoke them
 /// from a thread that may block (e.g. `tokio::task::spawn_blocking`).
+///
+/// On macOS, if the device was force-captured (kernel drivers detached) at
+/// open time, dropping the `OpenedDevice` calls `USBDeviceReEnumerate` with
+/// the release flag so macOS rebinds its built-in drivers.
 pub struct OpenedDevice {
     busid: String,
-    device: nusb::Device,
+    /// Wrapped in `Option` so the `Drop` impl can explicitly close the
+    /// `nusb` handle (releasing the `kIOUSBDevice` user-client) before
+    /// issuing the `reenumerate_release` call, which itself needs an
+    /// exclusive `USBDeviceOpenSeize`.
+    device: Option<nusb::Device>,
     interfaces: Mutex<HashMap<u8, nusb::Interface>>,
     /// Endpoint cache keyed by raw endpoint address (`bEndpointAddress`,
     /// including the direction bit).
     endpoints: Mutex<HashMap<u8, AnyEp>>,
+    /// `registry_entry_id` of the captured `IOService`, if force-capture
+    /// succeeded at open time. Used to issue a matching
+    /// `reenumerate_release` on drop.
+    #[cfg(target_os = "macos")]
+    captured_registry_id: Option<u64>,
+}
+
+#[cfg(target_os = "macos")]
+impl Drop for OpenedDevice {
+    fn drop(&mut self) {
+        if let Some(reg_id) = self.captured_registry_id.take() {
+            // Release all `nusb` resources first so the IOKit
+            // user-client is closed; otherwise `USBDeviceOpenSeize`
+            // inside `reenumerate_release` fails with
+            // `kIOReturnExclusiveAccess` because we are still the owner.
+            self.interfaces
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .clear();
+            self.endpoints
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .clear();
+            drop(self.device.take());
+            // The current IOService has been replaced (we re-enumerated
+            // at open time), so we need to find the *current* registry id
+            // by location_id. Best-effort: log and move on if anything
+            // fails — the user's worst case is having to unplug + replug.
+            let location_id = nusb::list_devices()
+                .wait()
+                .ok()
+                .and_then(|mut it| it.find(|i| format_busid(i) == self.busid))
+                .map(|i| (i.registry_entry_id(), i.location_id()));
+            let target = location_id.map_or(reg_id, |(rid, _)| rid);
+            debug!(
+                busid = %self.busid,
+                target = format!("{target:#x}"),
+                "releasing force-captured device"
+            );
+            if let Err(e) = capture::reenumerate_release(target) {
+                warn!(busid = %self.busid, error = %e, "reenumerate_release failed");
+            }
+        }
+    }
 }
 
 impl std::fmt::Debug for OpenedDevice {
@@ -244,18 +331,42 @@ impl std::fmt::Debug for OpenedDevice {
 
 impl OpenedDevice {
     /// Open a device by USB/IP busid (e.g. `"01-1"`).
+    ///
+    /// On macOS, if the current process is running as root, this also
+    /// force-detaches any kernel drivers attached to the device
+    /// (`IOUSBMassStorageClass`, `IOHIDFamily`, `AppleUSBCDC`, …) so that
+    /// `nusb::Interface::claim_interface` succeeds for every interface
+    /// regardless of class. Without root, only control transfers on
+    /// endpoint 0 are guaranteed to work for devices whose interfaces
+    /// macOS auto-binds.
     pub fn open(busid: &str) -> Result<Self, HostError> {
         let info = nusb::list_devices()
             .wait()?
             .find(|i| format_busid(i) == busid)
             .ok_or_else(|| HostError::NotFound(busid.to_owned()))?;
+
+        #[cfg(target_os = "macos")]
+        let (info, captured_registry_id) = {
+            let (new_info, captured) = maybe_capture(info, busid)?;
+            (new_info, captured)
+        };
+
         let device = info.open().wait()?;
         Ok(Self {
             busid: busid.to_owned(),
-            device,
+            device: Some(device),
             interfaces: Mutex::new(HashMap::new()),
             endpoints: Mutex::new(HashMap::new()),
+            #[cfg(target_os = "macos")]
+            captured_registry_id,
         })
+    }
+
+    /// Internal accessor. The `Option` is `Some` for the entire lifetime
+    /// of the `OpenedDevice` and is only taken inside `Drop`, so this
+    /// `expect` cannot fire from any public method.
+    fn device(&self) -> &nusb::Device {
+        self.device.as_ref().expect("device taken before drop")
     }
 
     pub fn busid(&self) -> &str {
@@ -283,7 +394,7 @@ impl OpenedDevice {
                 index: setup.w_index,
                 length: setup.w_length,
             };
-            let data = self.device.control_in(req, timeout).wait()?;
+            let data = self.device().control_in(req, timeout).wait()?;
             Ok(data)
         } else {
             let req = ControlOut {
@@ -294,7 +405,7 @@ impl OpenedDevice {
                 index: setup.w_index,
                 data: out_data,
             };
-            self.device.control_out(req, timeout).wait()?;
+            self.device().control_out(req, timeout).wait()?;
             Ok(Vec::new())
         }
     }
@@ -342,7 +453,7 @@ impl OpenedDevice {
     fn endpoint_kind(&self, ep_addr: u8) -> Result<(u8, EpKind), HostError> {
         use nusb::descriptors::TransferType;
         let cfg = self
-            .device
+            .device()
             .active_configuration()
             .map_err(|_| HostError::EndpointNotFound(ep_addr))?;
         for iface in cfg.interface_alt_settings() {
@@ -391,8 +502,68 @@ impl OpenedDevice {
                 return Ok(i.clone());
             }
         }
-        let iface = self.device.claim_interface(num).wait()?;
+        let iface = self.device().claim_interface(num).wait()?;
         let mut ifaces = self.interfaces.lock().expect("interface cache poisoned");
         Ok(ifaces.entry(num).or_insert(iface).clone())
+    }
+}
+
+// ---------------------------------------------------------------------------
+// macOS: force-detach kernel drivers via IOKit `USBDeviceReEnumerate`.
+// ---------------------------------------------------------------------------
+
+#[cfg(target_os = "macos")]
+fn maybe_capture(
+    info: nusb::DeviceInfo,
+    busid: &str,
+) -> Result<(nusb::DeviceInfo, Option<u64>), HostError> {
+    if !capture::is_root() {
+        debug!(busid, "skipping force-capture (not root)");
+        return Ok((info, None));
+    }
+
+    let reg_id = info.registry_entry_id();
+    let location_id = info.location_id();
+    let vid = info.vendor_id();
+    let pid = info.product_id();
+    info!(
+        busid,
+        vid = format!("{vid:04x}"),
+        pid = format!("{pid:04x}"),
+        location_id = format!("{location_id:#010x}"),
+        "force-capturing device (re-enumerating to detach kernel drivers)"
+    );
+
+    if let Err(e) = capture::reenumerate_with_capture(reg_id) {
+        warn!(busid, error = %e, "force-capture failed, falling back to plain claim");
+        return Ok((info, None));
+    }
+
+    // The device disappears for ~100–500 ms while it re-enumerates, and
+    // comes back with a new IOService (so a new registry_entry_id). Poll
+    // nusb::list_devices() looking for a device with the same
+    // (location_id, vid, pid) — the locationID is preserved across
+    // re-enumerate because the bus and port chain are unchanged.
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    let mut tries = 0u32;
+    loop {
+        tries += 1;
+        std::thread::sleep(Duration::from_millis(50));
+        let found = nusb::list_devices().wait()?.find(|i| {
+            i.location_id() == location_id && i.vendor_id() == vid && i.product_id() == pid
+        });
+        if let Some(new_info) = found {
+            let new_reg_id = new_info.registry_entry_id();
+            debug!(
+                busid,
+                tries,
+                new_reg_id = format!("{new_reg_id:#x}"),
+                "device reappeared after re-enumerate"
+            );
+            return Ok((new_info, Some(new_reg_id)));
+        }
+        if std::time::Instant::now() >= deadline {
+            return Err(HostError::ReenumerateTimeout);
+        }
     }
 }

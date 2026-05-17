@@ -34,6 +34,18 @@ enum Cmd {
         #[arg(long, default_value_t = SocketAddr::from(([127, 0, 0, 1], DEFAULT_PORT)))]
         listen: SocketAddr,
     },
+    /// Release a force-captured device back to macOS (root only).
+    ///
+    /// Manual escape hatch for the case where the daemon was killed
+    /// ungracefully (e.g. `SIGKILL`) while holding a device with the
+    /// `USBDeviceReEnumerate` capture flag set. macOS keeps the device
+    /// detached from its kernel drivers until either a release
+    /// re-enumerate or a physical unplug; this command does the former.
+    #[cfg(target_os = "macos")]
+    ReleaseCapture {
+        /// USB/IP busid of the device to release (e.g. `01-1`).
+        busid: String,
+    },
 }
 
 fn main() -> Result<()> {
@@ -47,7 +59,16 @@ fn main() -> Result<()> {
     match cli.cmd {
         Cmd::List => list(),
         Cmd::Daemon { listen } => daemon::run(listen),
+        #[cfg(target_os = "macos")]
+        Cmd::ReleaseCapture { busid } => release_capture(&busid),
     }
+}
+
+#[cfg(target_os = "macos")]
+fn release_capture(busid: &str) -> Result<()> {
+    host_mac::release_capture(busid)?;
+    println!("released capture for busid {busid}");
+    Ok(())
 }
 
 fn list() -> Result<()> {
