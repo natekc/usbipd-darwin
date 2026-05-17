@@ -18,5 +18,12 @@ core-foundation-sys = "0.8"
 io-kit-sys          = "0.4"
 libc                = "0.2"
 
+[dev-dependencies]
+ctrlc = "3"
+
+[[example]]
+name = "hid_keyboard"
+required-features = []
+
 [lints]
 workspace = true
