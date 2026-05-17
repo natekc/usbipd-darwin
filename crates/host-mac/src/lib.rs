@@ -12,7 +12,7 @@
 pub mod capture;
 
 use std::collections::HashMap;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex, RwLock};
 use std::time::Duration;
 
 use nusb::MaybeFuture;
@@ -274,7 +274,15 @@ pub struct OpenedDevice {
     interfaces: Mutex<HashMap<u8, nusb::Interface>>,
     /// Endpoint cache keyed by raw endpoint address (`bEndpointAddress`,
     /// including the direction bit).
-    endpoints: Mutex<HashMap<u8, AnyEp>>,
+    ///
+    /// Each cached endpoint is wrapped in its *own* `Mutex`, behind an
+    /// `Arc`, so a transfer on one endpoint never blocks transfers on
+    /// other endpoints. The outer `RwLock` is held only for the
+    /// (rare) cache insert and for the cheap `Arc::clone` on lookup;
+    /// the per-endpoint `Mutex` is the one held across the blocking
+    /// `nusb` transfer call. `nusb::Endpoint` is `!Sync`, so the
+    /// per-endpoint mutex is required for soundness anyway.
+    endpoints: RwLock<HashMap<u8, Arc<Mutex<AnyEp>>>>,
     /// `registry_entry_id` of the captured `IOService`, if force-capture
     /// succeeded at open time. Used to issue a matching
     /// `reenumerate_release` on drop.
@@ -295,7 +303,7 @@ impl Drop for OpenedDevice {
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
                 .clear();
             self.endpoints
-                .lock()
+                .write()
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
                 .clear();
             drop(self.device.take());
@@ -356,7 +364,7 @@ impl OpenedDevice {
             busid: busid.to_owned(),
             device: Some(device),
             interfaces: Mutex::new(HashMap::new()),
-            endpoints: Mutex::new(HashMap::new()),
+            endpoints: RwLock::new(HashMap::new()),
             #[cfg(target_os = "macos")]
             captured_registry_id,
         })
@@ -422,11 +430,10 @@ impl OpenedDevice {
         timeout: Duration,
     ) -> Result<Vec<u8>, HostError> {
         let kind = self.endpoint_kind(ep_addr)?;
-        self.ensure_endpoint(ep_addr, kind)?;
-        let mut endpoints = self.endpoints.lock().expect("endpoint cache poisoned");
-        let ep = endpoints
-            .get_mut(&ep_addr)
-            .expect("endpoint inserted by ensure_endpoint");
+        let ep = self.ensure_endpoint(ep_addr, kind)?;
+        // Lock ONLY this endpoint's mutex across the blocking transfer.
+        // Concurrent transfers on other endpoints proceed in parallel.
+        let mut ep_guard = ep.lock().expect("endpoint mutex poisoned");
         let buf = if ep_addr & 0x80 != 0 {
             nusb::transfer::Buffer::new(length)
         } else {
@@ -434,7 +441,7 @@ impl OpenedDevice {
             b.extend_from_slice(out_data);
             b
         };
-        let completion = match ep {
+        let completion = match &mut *ep_guard {
             AnyEp::BulkIn(e) => e.transfer_blocking(buf, timeout),
             AnyEp::BulkOut(e) => e.transfer_blocking(buf, timeout),
             AnyEp::InterruptIn(e) => e.transfer_blocking(buf, timeout),
@@ -445,6 +452,31 @@ impl OpenedDevice {
             Ok(data.into_vec())
         } else {
             Ok(Vec::new())
+        }
+    }
+
+    /// Cancel any in-flight transfers on `ep_addr`. Best-effort; safe to
+    /// call even if the endpoint has never been opened.
+    pub fn cancel_endpoint(&self, ep_addr: u8) {
+        let cached = self
+            .endpoints
+            .read()
+            .expect("endpoint cache poisoned")
+            .get(&ep_addr)
+            .cloned();
+        if let Some(ep) = cached {
+            // Cancellation does not require exclusive access in nusb, but
+            // its API takes `&mut self`, so we serialize with the
+            // per-endpoint mutex. This may briefly block behind an
+            // in-flight transfer; that's fine because cancellation will
+            // unblock that transfer almost immediately.
+            let mut g = ep.lock().expect("endpoint mutex poisoned");
+            match &mut *g {
+                AnyEp::BulkIn(e) => e.cancel_all(),
+                AnyEp::BulkOut(e) => e.cancel_all(),
+                AnyEp::InterruptIn(e) => e.cancel_all(),
+                AnyEp::InterruptOut(e) => e.cancel_all(),
+            }
         }
     }
 
@@ -471,11 +503,15 @@ impl OpenedDevice {
         Err(HostError::EndpointNotFound(ep_addr))
     }
 
-    fn ensure_endpoint(&self, ep_addr: u8, k: (u8, EpKind)) -> Result<(), HostError> {
+    fn ensure_endpoint(
+        &self,
+        ep_addr: u8,
+        k: (u8, EpKind),
+    ) -> Result<Arc<Mutex<AnyEp>>, HostError> {
         {
-            let endpoints = self.endpoints.lock().expect("endpoint cache poisoned");
-            if endpoints.contains_key(&ep_addr) {
-                return Ok(());
+            let endpoints = self.endpoints.read().expect("endpoint cache poisoned");
+            if let Some(ep) = endpoints.get(&ep_addr) {
+                return Ok(ep.clone());
             }
         }
         let (iface_num, kind) = k;
@@ -490,9 +526,9 @@ impl OpenedDevice {
                 AnyEp::InterruptOut(iface.endpoint::<Interrupt, Out>(ep_addr)?)
             }
         };
-        let mut endpoints = self.endpoints.lock().expect("endpoint cache poisoned");
-        endpoints.entry(ep_addr).or_insert(any);
-        Ok(())
+        let arc = Arc::new(Mutex::new(any));
+        let mut endpoints = self.endpoints.write().expect("endpoint cache poisoned");
+        Ok(endpoints.entry(ep_addr).or_insert(arc).clone())
     }
 
     fn ensure_interface(&self, num: u8) -> Result<nusb::Interface, HostError> {
