@@ -1,0 +1,17 @@
+[package]
+name = "host-mac"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+description = "macOS USB host backend (IOKit via nusb)"
+
+[dependencies]
+nusb      = { workspace = true }
+thiserror = { workspace = true }
+tracing   = { workspace = true }
+
+[lints]
+workspace = true

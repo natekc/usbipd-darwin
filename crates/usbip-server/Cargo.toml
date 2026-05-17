@@ -1,0 +1,18 @@
+[package]
+name = "usbip-server"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+description = "Transport-agnostic USB/IP server state machine"
+
+[dependencies]
+usbip-proto = { workspace = true }
+host-mac    = { workspace = true }
+thiserror   = { workspace = true }
+tracing     = { workspace = true }
+
+[lints]
+workspace = true

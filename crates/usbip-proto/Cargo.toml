@@ -1,0 +1,15 @@
+[package]
+name = "usbip-proto"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+description = "USB/IP wire protocol codec"
+
+[dependencies]
+thiserror = { workspace = true }
+
+[lints]
+workspace = true

@@ -1,0 +1,49 @@
+[workspace]
+resolver = "3"
+members = [
+    "crates/usbip-proto",
+    "crates/host-mac",
+    "crates/usbip-server",
+    "crates/usbipd",
+]
+
+[workspace.package]
+version = "0.0.1"
+edition = "2024"
+rust-version = "1.85"
+license = "Apache-2.0 OR MIT"
+repository = "https://github.com/lima-vm/usbipd-mac"
+authors = ["The Lima Authors"]
+
+[workspace.lints.rust]
+unsafe_code = "deny"
+missing_debug_implementations = "warn"
+rust_2018_idioms = { level = "warn", priority = -1 }
+
+[workspace.lints.clippy]
+pedantic = { level = "warn", priority = -1 }
+module_name_repetitions = "allow"
+missing_errors_doc = "allow"
+missing_panics_doc = "allow"
+unnecessary_wraps = "allow"
+
+[workspace.dependencies]
+# Internal crates
+usbip-proto  = { path = "crates/usbip-proto",  version = "0.0.1" }
+host-mac     = { path = "crates/host-mac",     version = "0.0.1" }
+usbip-server = { path = "crates/usbip-server", version = "0.0.1" }
+
+# External
+anyhow      = "1"
+thiserror   = "2"
+bytes       = "1"
+clap        = { version = "4", features = ["derive"] }
+tokio       = { version = "1", features = ["rt-multi-thread", "macros", "net", "io-util", "signal"] }
+tracing     = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+nusb        = "0.2"
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = "debuginfo"
