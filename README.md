@@ -34,10 +34,15 @@ List local USB devices:
 cargo run --release -- list
 ```
 
-Run the daemon (default `127.0.0.1:3240`):
+Run the daemon on loopback TCP (you must pick a policy — the default is
+DenyAll, which exports nothing):
 
 ```sh
-cargo run --release -- daemon --listen 0.0.0.0:3240
+# Allow a single device by VID:PID (repeatable).
+sudo cargo run --release -- daemon --allow 1050:0407
+
+# Or, on a fully-trusted single-user machine, allow everything.
+sudo cargo run --release -- daemon --allow-all
 ```
 
 From a Linux client:
@@ -47,6 +52,49 @@ sudo modprobe vhci-hcd
 sudo usbip list -r <mac-host>
 sudo usbip attach -r <mac-host> -b <busid>
 ```
+
+## Security model
+
+**USB/IP has no authentication and no transport encryption.** Anyone who
+can reach the listener can enumerate and attach any allow-listed device.
+This daemon therefore ships secure-by-default:
+
+| Knob | Default | What it does |
+| --- | --- | --- |
+| `--listen ADDR:PORT` | `127.0.0.1:3240` | Bind to loopback TCP only. |
+| `--allow VID:PID` | (none) | Allow-list one device. Repeatable. |
+| `--allow-all` | off | Allow every device. Equivalent to upstream Linux `usbipd` behaviour. |
+| `--allow-public` | off | Explicit ack required to bind a non-loopback TCP address. |
+| `--socket PATH` | (none) | Listen on a unix-domain socket (mode 0600) instead of TCP. |
+
+Recommended deployments, in order of preference:
+
+1. **Unix socket** (`--socket /run/usbipd.sock`) when the consumer is on
+   the same machine. Filesystem permissions are the only ACL needed.
+2. **Loopback TCP** when the consumer is a local VM forwarder (e.g. Lima
+   port-forwarding 3240 into the guest over its already-authenticated
+   SSH/vsock channel).
+3. **Public TCP** (`--allow-public`) only when a separate firewall or
+   VPN is providing transport-level authentication.
+
+Each successfully-imported device is also locked to its connecting
+client: a second concurrent `OP_REQ_IMPORT` for the same busid is
+refused so two clients can't fight over the same device.
+
+## Lima integration
+
+The intended Lima integration is the same shape as `socket_vmnet`:
+
+1. Lima writes a `--socket` path under its instance directory.
+2. Lima spawns `sudo usbipd daemon --socket <path> --allow VID:PID ...`
+   per the user's `usb:` config block.
+3. Lima forwards bytes between the unix socket and TCP 3240 in the
+   guest, where the guest kernel's `vhci-hcd` driver speaks USB/IP.
+
+Because the unix socket is mode 0600 owned by root, the only thing on
+the host that can talk to the daemon is Lima itself (running as the
+same user that started the VM and ran `limactl sudoers`). No network
+exposure, no protocol-level auth needed.
 
 ## Running with force-capture (root)
 
