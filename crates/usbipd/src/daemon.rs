@@ -151,6 +151,25 @@ async fn handle_import(mut stream: TcpStream, peer: SocketAddr) -> Result<()> {
     };
     info!(%peer, %busid, "device opened, entering URB loop");
 
+    // Fold the snapshot (real bConfigurationValue / bNumConfigurations
+    // from the opened device, and the deterministic busnum/devnum from
+    // OpenedDevice) into the pre-import enumeration entry, which has
+    // the descriptor strings.
+    let snap = opened.descriptor_snapshot();
+    let desc = UsbDevice {
+        busid: snap.busid.clone(),
+        busnum: snap.busnum,
+        devnum: snap.devnum,
+        configuration_value: snap.configuration_value,
+        num_configurations: snap.num_configurations,
+        interfaces: if snap.interfaces.is_empty() {
+            desc.interfaces.clone()
+        } else {
+            snap.interfaces
+        },
+        ..desc
+    };
+
     // Send success import reply.
     let mut out = Vec::with_capacity(8 + 312);
     encode_rep_import_ok(&mut out, &to_exported(&desc));

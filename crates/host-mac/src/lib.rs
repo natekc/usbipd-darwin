@@ -307,6 +307,13 @@ enum AnyEp {
     InterruptOut(nusb::Endpoint<Interrupt, Out>),
 }
 
+/// One cached endpoint. Tracks the owning interface so the cache can
+/// be invalidated wholesale on `SET_INTERFACE` / `SET_CONFIGURATION`.
+struct EndpointEntry {
+    iface_num: u8,
+    ep: Arc<Mutex<AnyEp>>,
+}
+
 #[derive(Clone, Copy)]
 enum EpKind {
     Bulk,
@@ -322,12 +329,20 @@ enum EpKind {
 /// the release flag so macOS rebinds its built-in drivers.
 pub struct OpenedDevice {
     busid: String,
+    /// `(busnum << 16) | devnum` — stable for the device's lifetime so
+    /// the daemon can validate per-URB devid headers.
+    devid: u32,
     /// Wrapped in `Option` so the `Drop` impl can explicitly close the
     /// `nusb` handle (releasing the `kIOUSBDevice` user-client) before
     /// issuing the `reenumerate_release` call, which itself needs an
     /// exclusive `USBDeviceOpenSeize`.
     device: Option<nusb::Device>,
     interfaces: Mutex<HashMap<u8, nusb::Interface>>,
+    /// Currently-selected alternate setting per interface number. Used
+    /// to resolve `endpoint_kind` against the *active* alt's endpoints
+    /// rather than the first matching alt. Updated by the
+    /// `SET_INTERFACE` interception in `control_transfer`.
+    alt_settings: Mutex<HashMap<u8, u8>>,
     /// Endpoint cache keyed by raw endpoint address (`bEndpointAddress`,
     /// including the direction bit).
     ///
@@ -338,7 +353,7 @@ pub struct OpenedDevice {
     /// the per-endpoint `Mutex` is the one held across the blocking
     /// `nusb` transfer call. `nusb::Endpoint` is `!Sync`, so the
     /// per-endpoint mutex is required for soundness anyway.
-    endpoints: RwLock<HashMap<u8, Arc<Mutex<AnyEp>>>>,
+    endpoints: RwLock<HashMap<u8, EndpointEntry>>,
     /// `registry_entry_id` of the captured `IOService`, if force-capture
     /// succeeded at open time. Used to issue a matching
     /// `reenumerate_release` on drop.
@@ -415,11 +430,15 @@ impl OpenedDevice {
             (new_info, captured)
         };
 
+        let (busnum, devnum) = derive_bus_dev(&info);
+        let devid = (busnum << 16) | devnum;
         let device = info.open().wait()?;
         Ok(Self {
             busid: busid.to_owned(),
+            devid,
             device: Some(device),
             interfaces: Mutex::new(HashMap::new()),
+            alt_settings: Mutex::new(HashMap::new()),
             endpoints: RwLock::new(HashMap::new()),
             #[cfg(target_os = "macos")]
             captured_registry_id,
@@ -437,16 +456,119 @@ impl OpenedDevice {
         &self.busid
     }
 
+    /// Snapshot the device's descriptors into a [`UsbDevice`] using the
+    /// real `bConfigurationValue` and `bNumConfigurations` from the
+    /// opened device (rather than the placeholders [`list_devices`]
+    /// returns). Used by the daemon to populate the `OP_REP_IMPORT`
+    /// reply accurately.
+    #[must_use]
+    pub fn descriptor_snapshot(&self) -> UsbDevice {
+        let dev = self.device();
+        let active_cfg = dev
+            .active_configuration()
+            .map(|c| c.configuration_value())
+            .unwrap_or(0);
+        let num_cfg = u8::try_from(dev.configurations().count()).unwrap_or(1);
+
+        // Interfaces from the *active* configuration, alt 0 of each.
+        let mut interfaces: Vec<UsbInterface> = Vec::new();
+        if let Ok(cfg) = dev.active_configuration() {
+            for iface in cfg.interface_alt_settings() {
+                if iface.alternate_setting() == 0 {
+                    interfaces.push(UsbInterface {
+                        class: iface.class(),
+                        subclass: iface.subclass(),
+                        protocol: iface.protocol(),
+                    });
+                }
+            }
+        }
+
+        UsbDevice {
+            busid: self.busid.clone(),
+            busnum: self.devid >> 16,
+            devnum: self.devid & 0xFFFF,
+            speed: 0,
+            vendor_id: 0,
+            product_id: 0,
+            bcd_device: 0,
+            class: 0,
+            subclass: 0,
+            protocol: 0,
+            configuration_value: active_cfg,
+            num_configurations: num_cfg.max(1),
+            manufacturer: None,
+            product: None,
+            serial: None,
+            interfaces,
+        }
+    }
+
+    /// USB/IP devid = `(busnum << 16) | devnum`. Stable for this device
+    /// across the daemon's lifetime, used to validate per-URB headers.
+    #[must_use]
+    pub fn devid(&self) -> u32 {
+        self.devid
+    }
+
     /// Issue a control transfer on endpoint 0. `setup` is the raw 8-byte USB
     /// SETUP packet (little-endian, as it appears on the bus). For IN
     /// transfers the returned `Vec` contains the response data; for OUT the
     /// caller-supplied `data` is sent and an empty `Vec` is returned.
+    ///
+    /// Standard `SET_CONFIGURATION` and `SET_INTERFACE` requests are
+    /// intercepted: they are translated into the corresponding
+    /// `nusb::Device::set_configuration` / `nusb::Interface::set_alt_setting`
+    /// calls so that nusb's interface and endpoint state is kept in sync
+    /// with what the guest believes. Without this interception, the raw
+    /// control passthrough would reconfigure the device on the wire but
+    /// leave nusb's claimed-interface state stale, so subsequent
+    /// bulk/interrupt transfers would fail or target the wrong alt.
     pub fn control_transfer(
         &self,
         setup: SetupPacket,
         out_data: &[u8],
         timeout: Duration,
     ) -> Result<Vec<u8>, HostError> {
+        // ---- intercepted standard requests ----
+        // SET_CONFIGURATION: bmRequestType=0x00, bRequest=0x09, wValue=cfg
+        if is_set_configuration(setup) {
+            let cfg = (setup.w_value & 0xFF) as u8;
+            debug!(busid = %self.busid, cfg, "intercepting SET_CONFIGURATION");
+            // Invalidate caches: interfaces and endpoints belong to the
+            // *previous* configuration.
+            self.interfaces
+                .lock()
+                .expect("interface cache poisoned")
+                .clear();
+            self.endpoints
+                .write()
+                .expect("endpoint cache poisoned")
+                .clear();
+            self.alt_settings
+                .lock()
+                .expect("alt-setting map poisoned")
+                .clear();
+            self.device().set_configuration(cfg).wait()?;
+            return Ok(Vec::new());
+        }
+        // SET_INTERFACE: bmRequestType=0x01, bRequest=0x0B, wValue=alt, wIndex=iface
+        if is_set_interface(setup) {
+            let alt = (setup.w_value & 0xFF) as u8;
+            let iface_num = (setup.w_index & 0xFF) as u8;
+            debug!(busid = %self.busid, iface_num, alt, "intercepting SET_INTERFACE");
+            // Drop cached endpoints that belong to this interface;
+            // they were bound to the previous alt and become invalid.
+            self.invalidate_interface_endpoints(iface_num);
+            let iface = self.ensure_interface(iface_num)?;
+            iface.set_alt_setting(alt).wait()?;
+            self.alt_settings
+                .lock()
+                .expect("alt-setting map poisoned")
+                .insert(iface_num, alt);
+            return Ok(Vec::new());
+        }
+
         let ct = setup.control_type();
         let rec = setup.recipient();
         if setup.is_in() {
@@ -472,6 +594,11 @@ impl OpenedDevice {
             self.device().control_out(req, timeout).wait()?;
             Ok(Vec::new())
         }
+    }
+
+    fn invalidate_interface_endpoints(&self, iface_num: u8) {
+        let mut endpoints = self.endpoints.write().expect("endpoint cache poisoned");
+        endpoints.retain(|_, e| e.iface_num != iface_num);
     }
 
     /// Issue a bulk or interrupt transfer on `ep_addr` (raw address, with
@@ -530,7 +657,7 @@ impl OpenedDevice {
             .read()
             .expect("endpoint cache poisoned")
             .get(&ep_addr)
-            .cloned();
+            .map(|e| e.ep.clone());
         if let Some(ep) = cached {
             // Cancellation does not require exclusive access in nusb, but
             // its API takes `&mut self`, so we serialize with the
@@ -548,14 +675,45 @@ impl OpenedDevice {
     }
 
     /// Look up which interface owns the given endpoint and what transfer
-    /// type it uses, by walking the active configuration descriptors.
+    /// type it uses, by walking the active configuration's descriptors,
+    /// restricted to each interface's currently-active alt setting.
+    ///
+    /// The active alt is what nusb's `set_alt_setting` last applied
+    /// (tracked in `self.alt_settings`); interfaces never explicitly
+    /// changed default to alt 0. This matches what the device itself
+    /// will route bulk/interrupt traffic to, so endpoints in *other*
+    /// alts (legal: same address, different transfer type) are
+    /// correctly ignored.
     fn endpoint_kind(&self, ep_addr: u8) -> Result<(u8, EpKind), HostError> {
         use nusb::descriptors::TransferType;
         let cfg = self
             .device()
             .active_configuration()
             .map_err(|_| HostError::EndpointNotFound(ep_addr))?;
+        let alt_map = self
+            .alt_settings
+            .lock()
+            .expect("alt-setting map poisoned")
+            .clone();
+        // Group alt settings by interface number so we can pick the
+        // *currently selected* alt per interface.
+        let mut by_iface: HashMap<u8, Vec<nusb::descriptors::InterfaceDescriptor<'_>>> =
+            HashMap::new();
         for iface in cfg.interface_alt_settings() {
+            by_iface
+                .entry(iface.interface_number())
+                .or_default()
+                .push(iface);
+        }
+        for (iface_num, alts) in &by_iface {
+            let active_alt = alt_map.get(iface_num).copied().unwrap_or(0);
+            let Some(iface) = alts
+                .iter()
+                .find(|a| a.alternate_setting() == active_alt)
+                .or_else(|| alts.first())
+            else {
+                continue;
+            };
             for ep in iface.endpoints() {
                 if ep.address() == ep_addr {
                     let kind = match ep.transfer_type() {
@@ -563,7 +721,7 @@ impl OpenedDevice {
                         TransferType::Interrupt => EpKind::Interrupt,
                         _ => return Err(HostError::UnsupportedTransfer(ep_addr)),
                     };
-                    return Ok((iface.interface_number(), kind));
+                    return Ok((*iface_num, kind));
                 }
             }
         }
@@ -577,8 +735,8 @@ impl OpenedDevice {
     ) -> Result<Arc<Mutex<AnyEp>>, HostError> {
         {
             let endpoints = self.endpoints.read().expect("endpoint cache poisoned");
-            if let Some(ep) = endpoints.get(&ep_addr) {
-                return Ok(ep.clone());
+            if let Some(entry) = endpoints.get(&ep_addr) {
+                return Ok(entry.ep.clone());
             }
         }
         let (iface_num, kind) = k;
@@ -595,7 +753,11 @@ impl OpenedDevice {
         };
         let arc = Arc::new(Mutex::new(any));
         let mut endpoints = self.endpoints.write().expect("endpoint cache poisoned");
-        Ok(endpoints.entry(ep_addr).or_insert(arc).clone())
+        let entry = endpoints.entry(ep_addr).or_insert(EndpointEntry {
+            iface_num,
+            ep: arc,
+        });
+        Ok(entry.ep.clone())
     }
 
     fn ensure_interface(&self, num: u8) -> Result<nusb::Interface, HostError> {
@@ -609,6 +771,20 @@ impl OpenedDevice {
         let mut ifaces = self.interfaces.lock().expect("interface cache poisoned");
         Ok(ifaces.entry(num).or_insert(iface).clone())
     }
+}
+
+/// `true` if `setup` is a standard `SET_CONFIGURATION` request
+/// (bmRequestType=0x00, bRequest=0x09).
+#[must_use]
+fn is_set_configuration(setup: SetupPacket) -> bool {
+    !setup.is_in() && setup.bm_request_type == 0x00 && setup.b_request == 0x09
+}
+
+/// `true` if `setup` is a standard `SET_INTERFACE` request
+/// (bmRequestType=0x01, bRequest=0x0B).
+#[must_use]
+fn is_set_interface(setup: SetupPacket) -> bool {
+    !setup.is_in() && setup.bm_request_type == 0x01 && setup.b_request == 0x0B
 }
 
 // ---------------------------------------------------------------------------
@@ -731,5 +907,34 @@ mod tests {
         let a = derive_bus_dev_inner("1", &[1, 2], 3);
         let b = derive_bus_dev_inner("2", &[1, 2], 3);
         assert_ne!(a.0, b.0, "bus tokens must differ across buses");
+    }
+
+    fn setup(bm: u8, b: u8, val: u16, idx: u16, len: u16) -> SetupPacket {
+        SetupPacket {
+            bm_request_type: bm,
+            b_request: b,
+            w_value: val,
+            w_index: idx,
+            w_length: len,
+        }
+    }
+
+    #[test]
+    fn detects_set_configuration() {
+        assert!(is_set_configuration(setup(0x00, 0x09, 1, 0, 0)));
+        // IN direction must not match.
+        assert!(!is_set_configuration(setup(0x80, 0x09, 1, 0, 0)));
+        // Wrong bRequest.
+        assert!(!is_set_configuration(setup(0x00, 0x0B, 1, 0, 0)));
+        // Class request to device, not standard.
+        assert!(!is_set_configuration(setup(0x20, 0x09, 1, 0, 0)));
+    }
+
+    #[test]
+    fn detects_set_interface() {
+        assert!(is_set_interface(setup(0x01, 0x0B, 0, 2, 0)));
+        assert!(!is_set_interface(setup(0x81, 0x0B, 0, 2, 0)));
+        // Recipient must be interface (low 5 bits = 1).
+        assert!(!is_set_interface(setup(0x00, 0x0B, 0, 2, 0)));
     }
 }
