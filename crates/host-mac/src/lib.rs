@@ -98,8 +98,7 @@ pub struct UsbDevice {
 pub fn list_devices() -> Result<Vec<UsbDevice>, HostError> {
     let mut out = Vec::new();
     for info in nusb::list_devices().wait()? {
-        let (busnum, devnum) = derive_bus_dev(&info);
-        out.push(UsbDevice::from_nusb(&info, busnum, devnum));
+        out.push(UsbDevice::from_info(&info));
     }
     Ok(out)
 }
@@ -118,8 +117,14 @@ pub fn list_devices() -> Result<Vec<UsbDevice>, HostError> {
 /// upper byte of the locationID and the port chain is the rest, so
 /// this is effectively a hash of the locationID; on Linux it is the
 /// real `busnum`/port chain. The result is non-zero (per USB/IP
-/// convention) and fits in 32 bits with the high 16 reserved for
-/// busnum.
+/// convention).
+///
+/// **Both halves must fit in `u8`.** Linux's `usbip-utils` calls
+/// `usbip_vhci_attach_device(..., uint8_t busnum, uint8_t devnum, ...)`
+/// which silently truncates anything wider; the kernel then sends URBs
+/// with the truncated `devid = (busnum << 16) | devnum` and our URB-loop
+/// devid check fails. Clamping to 8 bits here keeps the wire value
+/// roundtrippable through every known client.
 #[must_use]
 fn derive_bus_dev(info: &nusb::DeviceInfo) -> (u32, u32) {
     derive_bus_dev_inner(info.bus_id(), info.port_chain(), info.device_address())
@@ -127,32 +132,52 @@ fn derive_bus_dev(info: &nusb::DeviceInfo) -> (u32, u32) {
 
 fn derive_bus_dev_inner(bus_id: &str, port_chain: &[u8], device_address: u8) -> (u32, u32) {
     let bus_token = parse_bus_id(bus_id);
-    // Hash the port chain into a 15-bit slot (1..=0x7FFF) so devnum is
-    // never zero (Linux uses 0 for "unassigned").
     let mut h: u32 = 0x811C_9DC5; // FNV offset basis
     for &p in port_chain {
         h = h.wrapping_mul(0x0100_0193) ^ u32::from(p);
     }
     // Mix in device address as a tiebreaker for the (rare) hash collision.
     h = h.wrapping_mul(0x0100_0193) ^ u32::from(device_address);
-    let devnum = (h & 0x7FFF).max(1);
+    // Fold all 32 bits of entropy down into the 8-bit slot Linux's
+    // usbip-utils gives us (see doc comment above). devnum 0 means
+    // "unassigned" to Linux, so clamp to 1..=255.
+    let devnum = u32::from(fold_to_u8(h)).max(1);
     (bus_token, devnum)
 }
 
+/// XOR-fold a 32-bit hash down to 8 bits, preserving entropy from
+/// every byte.
+fn fold_to_u8(h: u32) -> u8 {
+    let bytes = h.to_le_bytes();
+    bytes[0] ^ bytes[1] ^ bytes[2] ^ bytes[3]
+}
+
 /// Parse a `nusb` bus id (a short numeric or alphanumeric string) into
-/// a 1..=0xFFFF bus token. Falls back to a hash for unparseable ids.
+/// a 1..=0xFF bus token. Falls back to a hash for unparseable ids.
+/// 8-bit ceiling matches the constraint that Linux's `usbip-utils`
+/// roundtrips `busnum` as `uint8_t` (see [`derive_bus_dev_inner`]).
 fn parse_bus_id(bus_id: &str) -> u32 {
     if let Ok(n) = bus_id.parse::<u32>() {
-        return n.clamp(1, 0xFFFF);
+        return n.clamp(1, 0xFF);
     }
     let mut h: u32 = 0x811C_9DC5;
     for b in bus_id.bytes() {
         h = h.wrapping_mul(0x0100_0193) ^ u32::from(b);
     }
-    (h & 0xFFFF).max(1)
+    u32::from(fold_to_u8(h)).max(1)
 }
 
 impl UsbDevice {
+    /// Build a [`UsbDevice`] from a [`nusb::DeviceInfo`], computing the
+    /// synthesized `(busnum, devnum)` pair on the fly. Used by both the
+    /// enumeration path (`list_devices`) and the hotplug event path so
+    /// they cannot drift.
+    #[must_use]
+    pub fn from_info(info: &nusb::DeviceInfo) -> Self {
+        let (busnum, devnum) = derive_bus_dev(info);
+        Self::from_nusb(info, busnum, devnum)
+    }
+
     fn from_nusb(info: &nusb::DeviceInfo, busnum: u32, devnum: u32) -> Self {
         let interfaces = info
             .interfaces()
@@ -465,8 +490,7 @@ impl OpenedDevice {
         let (busnum, devnum) = derive_bus_dev(&info);
         let devid = (busnum << 16) | devnum;
         #[cfg(target_os = "macos")]
-        let captured_vid_pid = captured_registry_id
-            .map(|_| (info.vendor_id(), info.product_id()));
+        let captured_vid_pid = captured_registry_id.map(|_| (info.vendor_id(), info.product_id()));
         let device = info.open().wait()?;
         Ok(Self {
             busid: busid.to_owned(),
@@ -790,10 +814,9 @@ impl OpenedDevice {
         };
         let arc = Arc::new(Mutex::new(any));
         let mut endpoints = self.endpoints.write().expect("endpoint cache poisoned");
-        let entry = endpoints.entry(ep_addr).or_insert(EndpointEntry {
-            iface_num,
-            ep: arc,
-        });
+        let entry = endpoints
+            .entry(ep_addr)
+            .or_insert(EndpointEntry { iface_num, ep: arc });
         Ok(entry.ep.clone())
     }
 
@@ -893,8 +916,8 @@ mod tests {
         assert_eq!(parse_bus_id("1"), 1);
         assert_eq!(parse_bus_id("42"), 42);
         assert_eq!(parse_bus_id("0"), 1, "bus token must never be zero");
-        assert_eq!(parse_bus_id("65535"), 0xFFFF);
-        assert_eq!(parse_bus_id("70000"), 0xFFFF, "clamped to u16 max");
+        assert_eq!(parse_bus_id("255"), 0xFF);
+        assert_eq!(parse_bus_id("70000"), 0xFF, "clamped to u8 max");
     }
 
     #[test]
@@ -903,7 +926,10 @@ mod tests {
         let a = parse_bus_id("ehci-pci");
         let b = parse_bus_id("xhci-hcd");
         assert!(a >= 1 && b >= 1);
-        assert_ne!(a, b, "different ids should usually produce different tokens");
+        assert_ne!(
+            a, b,
+            "different ids should usually produce different tokens"
+        );
     }
 
     #[test]
@@ -926,14 +952,37 @@ mod tests {
     #[test]
     fn derive_bus_dev_devnum_is_nonzero_and_in_range() {
         // Sweep a few hundred synthetic devices and assert devnum
-        // invariants. Linux usbip clients reject devnum == 0.
+        // invariants. Linux usbip clients reject devnum == 0 and
+        // truncate anything wider than u8 (see `derive_bus_dev_inner`).
         for bus in 1..4 {
             for port in 1..50u8 {
                 for addr in 1..10u8 {
-                    let (_b, d) =
-                        derive_bus_dev_inner(&bus.to_string(), &[port, port ^ 0x55], addr);
+                    let (b, d) = derive_bus_dev_inner(&bus.to_string(), &[port, port ^ 0x55], addr);
                     assert!(d >= 1, "devnum must be >=1");
-                    assert!(d <= 0x7FFF, "devnum must fit 15 bits");
+                    assert!(d <= 0xFF, "devnum must fit u8 for Linux usbip-utils");
+                    assert!((1..=0xFF).contains(&b), "busnum must fit u8");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn derive_bus_dev_roundtrips_through_linux_usbip_truncation() {
+        // Regression test for the URB-loop devid mismatch caused by
+        // Linux's `usbip_vhci_attach_device(..., uint8_t busnum,
+        // uint8_t devnum, ...)`: anything we synthesize must survive
+        // the silent truncation to u8 that the client performs before
+        // writing devid to vhci sysfs.
+        for bus in 1..8u32 {
+            for port in 1..32u8 {
+                for addr in 1..16u8 {
+                    let (b, d) = derive_bus_dev_inner(&bus.to_string(), &[port], addr);
+                    let sent_devid = (b << 16) | d;
+                    let roundtrip_devid = ((b & 0xFF) << 16) | (d & 0xFF);
+                    assert_eq!(
+                        sent_devid, roundtrip_devid,
+                        "devid must survive u8 truncation: bus={bus} port={port} addr={addr}"
+                    );
                 }
             }
         }
