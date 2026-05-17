@@ -233,40 +233,49 @@ async fn handle_submit(
     let seqnum = basic.seqnum;
 
     // Run the actual nusb call on a blocking thread.
-    let result = tokio::task::spawn_blocking(move || {
+    let result = tokio::task::spawn_blocking(move || -> Result<(usize, Vec<u8>), host_mac::HostError> {
         if ep == 0 {
             let setup = SetupPacket::from_bytes(cmd.setup);
-            opened.control_transfer(setup, &out_payload, URB_TIMEOUT)
+            let data = opened.control_transfer(setup, &out_payload, URB_TIMEOUT)?;
+            // Control transfers report all-or-nothing; actual_length is
+            // the returned byte count for IN, or out_payload.len() for OUT.
+            let len = if dir_in { data.len() } else { out_payload.len() };
+            Ok((len, data))
         } else {
             let ep_addr = u8::try_from(ep & 0xF).unwrap_or(0) | if dir_in { 0x80 } else { 0x00 };
-            opened.data_transfer(ep_addr, tbl, &out_payload, URB_TIMEOUT)
+            let r = opened.data_transfer(ep_addr, tbl, &out_payload, URB_TIMEOUT)?;
+            Ok((r.actual_length, r.data))
         }
     })
     .await
     .context("join transfer task")?;
 
-    let (status, payload) = match result {
-        Ok(data) => {
+    let (status, actual_length, payload) = match result {
+        Ok((actual, data)) => {
             if dir_in {
                 // Mass-storage and most other classes treat a short read as
                 // success — actual_length reflects the real byte count.
                 if data.len() > tbl {
                     // Defensive: refuse to ship more than the client asked.
-                    (EOVERFLOW, Vec::new())
+                    (EOVERFLOW, 0, Vec::new())
                 } else {
-                    (0, data)
+                    let actual_i32 = i32::try_from(actual).unwrap_or(i32::MAX);
+                    (0, actual_i32, data)
                 }
             } else {
-                (0, Vec::new())
+                // For OUT, `actual` is bytes the device accepted (may be
+                // short). USB/IP encodes this in RET_SUBMIT.actual_length
+                // so the client can detect short writes.
+                let actual_i32 = i32::try_from(actual).unwrap_or(i32::MAX);
+                (0, actual_i32, Vec::new())
             }
         }
         Err(e) => {
             warn!(seqnum, ep, error = %e, "transfer failed");
-            (EPIPE, Vec::new())
+            (EPIPE, 0, Vec::new())
         }
     };
 
-    let actual_length = i32::try_from(payload.len()).unwrap_or(i32::MAX);
     let ret = RetSubmit {
         status,
         actual_length,

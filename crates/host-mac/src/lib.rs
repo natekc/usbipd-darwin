@@ -288,6 +288,18 @@ impl SetupPacket {
     }
 }
 
+/// Result of a bulk or interrupt transfer.
+#[derive(Debug, Default, Clone)]
+pub struct TransferResult {
+    /// Bytes actually transferred. For IN transfers this equals
+    /// `data.len()`. For OUT transfers this is the number of bytes the
+    /// device accepted, which can be less than what the caller submitted
+    /// (a short bulk write).
+    pub actual_length: usize,
+    /// Received bytes for IN transfers. Empty for OUT.
+    pub data: Vec<u8>,
+}
+
 enum AnyEp {
     BulkIn(nusb::Endpoint<Bulk, In>),
     BulkOut(nusb::Endpoint<Bulk, Out>),
@@ -463,22 +475,25 @@ impl OpenedDevice {
     }
 
     /// Issue a bulk or interrupt transfer on `ep_addr` (raw address, with
-    /// direction bit). For IN transfers `out_data` is ignored and `length`
-    /// bytes are returned; for OUT transfers `out_data` is sent and an empty
-    /// vec is returned.
+    /// direction bit). For IN transfers `out_data` is ignored and at most
+    /// `length` bytes are returned. For OUT transfers `out_data` is sent
+    /// and `data` is empty; `actual_length` reports how many bytes the
+    /// device accepted (which may be less than `out_data.len()` on a
+    /// short bulk write).
     pub fn data_transfer(
         &self,
         ep_addr: u8,
         length: usize,
         out_data: &[u8],
         timeout: Duration,
-    ) -> Result<Vec<u8>, HostError> {
+    ) -> Result<TransferResult, HostError> {
         let kind = self.endpoint_kind(ep_addr)?;
         let ep = self.ensure_endpoint(ep_addr, kind)?;
         // Lock ONLY this endpoint's mutex across the blocking transfer.
         // Concurrent transfers on other endpoints proceed in parallel.
         let mut ep_guard = ep.lock().expect("endpoint mutex poisoned");
-        let buf = if ep_addr & 0x80 != 0 {
+        let dir_in = ep_addr & 0x80 != 0;
+        let buf = if dir_in {
             nusb::transfer::Buffer::new(length)
         } else {
             let mut b = nusb::transfer::Buffer::new(out_data.len());
@@ -491,11 +506,19 @@ impl OpenedDevice {
             AnyEp::InterruptIn(e) => e.transfer_blocking(buf, timeout),
             AnyEp::InterruptOut(e) => e.transfer_blocking(buf, timeout),
         };
+        // Pull actual_length BEFORE consuming the buffer via into_result.
+        let actual_length = completion.actual_len;
         let data = completion.into_result()?;
-        if ep_addr & 0x80 != 0 {
-            Ok(data.into_vec())
+        if dir_in {
+            Ok(TransferResult {
+                actual_length,
+                data: data.into_vec(),
+            })
         } else {
-            Ok(Vec::new())
+            Ok(TransferResult {
+                actual_length,
+                data: Vec::new(),
+            })
         }
     }
 

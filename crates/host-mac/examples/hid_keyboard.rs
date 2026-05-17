@@ -45,13 +45,18 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         // 8-byte HID boot keyboard report; 1 s timeout so we can poll
         // the Ctrl-C flag.
         match dev.data_transfer(0x81, 8, &[], Duration::from_secs(1)) {
-            Ok(report) if report.len() == 8 => {
+            Ok(r) if r.data.len() == 8 => {
+                let report: [u8; 8] = r.data.as_slice().try_into().unwrap_or([0u8; 8]);
                 if report != prev {
                     print_report(&report, &prev);
-                    prev = report.as_slice().try_into().unwrap_or([0u8; 8]);
+                    prev = report;
                 }
             }
-            Ok(other) => eprintln!("short report ({} bytes): {other:02x?}", other.len()),
+            Ok(other) => eprintln!(
+                "short report ({} bytes): {:02x?}",
+                other.data.len(),
+                other.data
+            ),
             Err(host_mac::HostError::Transfer(nusb::transfer::TransferError::Cancelled)) => {} // 1 s poll timeout
             Err(e) => {
                 eprintln!("transfer error: {e}");
