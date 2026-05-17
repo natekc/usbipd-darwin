@@ -234,9 +234,7 @@ async fn serve(config: DaemonConfig) -> Result<()> {
             // Tighten permissions: only the owning user should be able to
             // connect. Filesystem permissions are the only access control
             // a unix-socket transport offers.
-            if let Err(e) =
-                std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))
-            {
+            if let Err(e) = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600)) {
                 warn!(error = %e, "could not chmod 0600 on socket; access will fall back to umask");
             }
             accept_loop_unix(listener, path.clone(), &state, &mut shutdown).await
@@ -356,11 +354,7 @@ async fn handle_session(
     }
 }
 
-async fn handle_devlist(
-    writer: &SharedWriter,
-    peer: &str,
-    state: &Arc<DaemonState>,
-) -> Result<()> {
+async fn handle_devlist(writer: &SharedWriter, peer: &str, state: &Arc<DaemonState>) -> Result<()> {
     let devices = host_mac::list_devices().context("enumerate USB devices")?;
     let total = devices.len();
     let filtered = state.policy.filter(devices);
@@ -602,14 +596,14 @@ async fn handle_cmd_submit(
             .expect("inflight map poisoned")
             .remove(&seqnum);
     });
-    inflight
-        .lock()
-        .expect("inflight map poisoned")
-        .insert(seqnum, Inflight {
+    inflight.lock().expect("inflight map poisoned").insert(
+        seqnum,
+        Inflight {
             abort: handle.abort_handle(),
             ep_addr,
             cancelled,
-        });
+        },
+    );
     Ok(())
 }
 
@@ -705,7 +699,11 @@ async fn run_submit(
             if ep == 0 {
                 let setup = SetupPacket::from_bytes(cmd.setup);
                 let data = opened.control_transfer(setup, &out_payload, timeout)?;
-                let len = if dir_in { data.len() } else { out_payload.len() };
+                let len = if dir_in {
+                    data.len()
+                } else {
+                    out_payload.len()
+                };
                 Ok((len, data))
             } else {
                 let ep_addr =
@@ -881,7 +879,10 @@ mod tests {
         assert!(g3.is_some());
         drop(g1);
         let g4 = state.try_attach("01-1", peer2);
-        assert!(g4.is_some(), "should be re-attachable after first guard dropped");
+        assert!(
+            g4.is_some(),
+            "should be re-attachable after first guard dropped"
+        );
     }
 
     #[test]

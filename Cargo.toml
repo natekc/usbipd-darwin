@@ -45,6 +45,9 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 nusb        = "0.2"
 serde       = { version = "1", features = ["derive"] }
 serde_json  = "1"
+# Only the `Stream` trait is needed (to poll `nusb::HotplugWatch`); the
+# heavier `futures` umbrella crate is intentionally avoided.
+futures-core = "0.3"
 
 [profile.release]
 lto = "thin"

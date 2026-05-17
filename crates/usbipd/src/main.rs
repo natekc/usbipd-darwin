@@ -3,6 +3,7 @@
 #![forbid(unsafe_code)]
 
 mod daemon;
+mod events;
 mod sudoers;
 
 use anyhow::{Context, Result, anyhow};
@@ -77,6 +78,21 @@ enum Cmd {
         #[arg(long)]
         allow_public: bool,
     },
+    /// Stream USB hotplug events as NDJSON over a unix socket.
+    ///
+    /// Intended for integrations like Lima that want to auto-attach
+    /// devices as they appear. The socket is created with mode 0600;
+    /// multiple consumers may subscribe simultaneously, and each new
+    /// subscriber first receives the current device set as `added`
+    /// events. See the `events` module docs for the on-wire schema.
+    Events {
+        /// Unix-domain socket path to bind. Any existing socket file
+        /// at this path is replaced; any existing non-socket file is
+        /// preserved (the command fails instead).
+        #[arg(long, value_name = "PATH")]
+        socket: PathBuf,
+    },
+
     /// Print a `NOPASSWD:NOSETENV` sudoers fragment for an exact
     /// `usbipd daemon ...` invocation.
     ///
@@ -183,6 +199,7 @@ fn main() -> Result<()> {
             })
             .context("daemon")
         }
+        Cmd::Events { socket } => events::run(socket).context("events"),
         Cmd::Sudoers {
             group,
             binary,
@@ -254,7 +271,10 @@ fn list(json: bool) -> Result<()> {
             "     class={:02x}/{:02x}/{:02x}",
             d.class, d.subclass, d.protocol
         );
-        println!("     allow with: --allow {:04x}:{:04x}", d.vendor_id, d.product_id);
+        println!(
+            "     allow with: --allow {:04x}:{:04x}",
+            d.vendor_id, d.product_id
+        );
     }
     Ok(())
 }
