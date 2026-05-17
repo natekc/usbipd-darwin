@@ -27,7 +27,13 @@ struct Cli {
 #[derive(Debug, Subcommand)]
 enum Cmd {
     /// List local USB devices available for sharing.
-    List,
+    List {
+        /// Emit machine-readable JSON instead of the human-readable
+        /// table. Stable output, suitable for `jq` and for Lima's
+        /// device-picker UI.
+        #[arg(long)]
+        json: bool,
+    },
     /// Run the USB/IP server.
     ///
     /// By default the daemon binds to 127.0.0.1 and refuses to export
@@ -102,7 +108,7 @@ fn main() -> Result<()> {
 
     let cli = Cli::parse();
     match cli.cmd {
-        Cmd::List => list(),
+        Cmd::List { json } => list(json),
         Cmd::Daemon {
             listen,
             socket,
@@ -140,8 +146,15 @@ fn release_capture(busid: &str) -> Result<()> {
     Ok(())
 }
 
-fn list() -> Result<()> {
+fn list(json: bool) -> Result<()> {
     let devices = host_mac::list_devices().map_err(|e| anyhow!("{e}"))?;
+    if json {
+        let rows: Vec<JsonDevice> = devices.iter().map(JsonDevice::from).collect();
+        let stdout = std::io::stdout().lock();
+        serde_json::to_writer_pretty(stdout, &rows).context("write json")?;
+        println!();
+        return Ok(());
+    }
     println!("Local USB devices");
     println!("=================");
     if devices.is_empty() {
@@ -163,4 +176,37 @@ fn list() -> Result<()> {
         println!("     allow with: --allow {:04x}:{:04x}", d.vendor_id, d.product_id);
     }
     Ok(())
+}
+
+/// JSON projection of a device. Field set is deliberately small and
+/// stable: any consumer (e.g. Lima's device-picker) should be able to
+/// rely on these field names and types not changing without a major
+/// version bump.
+#[derive(serde::Serialize)]
+struct JsonDevice {
+    busid: String,
+    vendor_id: String,
+    product_id: String,
+    manufacturer: Option<String>,
+    product: Option<String>,
+    class: u8,
+    subclass: u8,
+    protocol: u8,
+    speed: u32,
+}
+
+impl From<&host_mac::UsbDevice> for JsonDevice {
+    fn from(d: &host_mac::UsbDevice) -> Self {
+        Self {
+            busid: d.busid.clone(),
+            vendor_id: format!("{:04x}", d.vendor_id),
+            product_id: format!("{:04x}", d.product_id),
+            manufacturer: d.manufacturer.clone(),
+            product: d.product.clone(),
+            class: d.class,
+            subclass: d.subclass,
+            protocol: d.protocol,
+            speed: d.speed,
+        }
+    }
 }

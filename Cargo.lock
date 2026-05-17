@@ -863,6 +863,8 @@ dependencies = [
  "anyhow",
  "clap",
  "host-mac",
+ "serde",
+ "serde_json",
  "tokio",
  "tracing",
  "tracing-subscriber",
