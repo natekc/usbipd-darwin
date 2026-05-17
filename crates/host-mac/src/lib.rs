@@ -97,15 +97,59 @@ pub struct UsbDevice {
 /// without claiming the device.
 pub fn list_devices() -> Result<Vec<UsbDevice>, HostError> {
     let mut out = Vec::new();
-    for (idx, info) in nusb::list_devices().wait()?.enumerate() {
-        // Synthesize stable per-process bus/dev numbers. The exact values
-        // don't matter to USB/IP clients as long as they round-trip; we
-        // pick (1, idx+1) so devnum starts at 1.
-        let busnum = 1;
-        let devnum = u32::try_from(idx).unwrap_or(0) + 1;
+    for info in nusb::list_devices().wait()? {
+        let (busnum, devnum) = derive_bus_dev(&info);
         out.push(UsbDevice::from_nusb(&info, busnum, devnum));
     }
     Ok(out)
+}
+
+/// Derive a stable `(busnum, devnum)` pair from a `DeviceInfo`.
+///
+/// USB/IP encodes `devid = (busnum << 16) | devnum`. Linux fills these
+/// from kernel-assigned numbers that change on every reconnect; we
+/// need a value that is **stable** across reconnects of the same
+/// daemon so that the per-URB devid check in the URB loop is
+/// meaningful and so that clients see the same id between
+/// `OP_REP_DEVLIST` and `OP_REP_IMPORT`.
+///
+/// We derive it from the host bus id and port chain (both of which are
+/// stable for a given physical port). On macOS the bus id is the
+/// upper byte of the locationID and the port chain is the rest, so
+/// this is effectively a hash of the locationID; on Linux it is the
+/// real `busnum`/port chain. The result is non-zero (per USB/IP
+/// convention) and fits in 32 bits with the high 16 reserved for
+/// busnum.
+#[must_use]
+fn derive_bus_dev(info: &nusb::DeviceInfo) -> (u32, u32) {
+    derive_bus_dev_inner(info.bus_id(), info.port_chain(), info.device_address())
+}
+
+fn derive_bus_dev_inner(bus_id: &str, port_chain: &[u8], device_address: u8) -> (u32, u32) {
+    let bus_token = parse_bus_id(bus_id);
+    // Hash the port chain into a 15-bit slot (1..=0x7FFF) so devnum is
+    // never zero (Linux uses 0 for "unassigned").
+    let mut h: u32 = 0x811C_9DC5; // FNV offset basis
+    for &p in port_chain {
+        h = h.wrapping_mul(0x0100_0193) ^ u32::from(p);
+    }
+    // Mix in device address as a tiebreaker for the (rare) hash collision.
+    h = h.wrapping_mul(0x0100_0193) ^ u32::from(device_address);
+    let devnum = (h & 0x7FFF).max(1);
+    (bus_token, devnum)
+}
+
+/// Parse a `nusb` bus id (a short numeric or alphanumeric string) into
+/// a 1..=0xFFFF bus token. Falls back to a hash for unparseable ids.
+fn parse_bus_id(bus_id: &str) -> u32 {
+    if let Ok(n) = bus_id.parse::<u32>() {
+        return n.clamp(1, 0xFFFF);
+    }
+    let mut h: u32 = 0x811C_9DC5;
+    for b in bus_id.bytes() {
+        h = h.wrapping_mul(0x0100_0193) ^ u32::from(b);
+    }
+    (h & 0xFFFF).max(1)
 }
 
 impl UsbDevice {
@@ -601,5 +645,68 @@ fn maybe_capture(
         if std::time::Instant::now() >= deadline {
             return Err(HostError::ReenumerateTimeout);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_bus_id_numeric() {
+        assert_eq!(parse_bus_id("1"), 1);
+        assert_eq!(parse_bus_id("42"), 42);
+        assert_eq!(parse_bus_id("0"), 1, "bus token must never be zero");
+        assert_eq!(parse_bus_id("65535"), 0xFFFF);
+        assert_eq!(parse_bus_id("70000"), 0xFFFF, "clamped to u16 max");
+    }
+
+    #[test]
+    fn parse_bus_id_alphanumeric_falls_back_to_hash() {
+        // Hashes are deterministic and non-zero.
+        let a = parse_bus_id("ehci-pci");
+        let b = parse_bus_id("xhci-hcd");
+        assert!(a >= 1 && b >= 1);
+        assert_ne!(a, b, "different ids should usually produce different tokens");
+    }
+
+    #[test]
+    fn derive_bus_dev_is_deterministic() {
+        let a = derive_bus_dev_inner("1", &[2, 3], 4);
+        let b = derive_bus_dev_inner("1", &[2, 3], 4);
+        assert_eq!(a, b);
+    }
+
+    #[test]
+    fn derive_bus_dev_distinguishes_ports() {
+        // Two devices on the same bus but different port chains must
+        // produce different devnums so usbip clients can tell them apart.
+        let a = derive_bus_dev_inner("1", &[2], 7);
+        let b = derive_bus_dev_inner("1", &[3], 7);
+        assert_eq!(a.0, b.0, "same bus token");
+        assert_ne!(a.1, b.1, "different devnums");
+    }
+
+    #[test]
+    fn derive_bus_dev_devnum_is_nonzero_and_in_range() {
+        // Sweep a few hundred synthetic devices and assert devnum
+        // invariants. Linux usbip clients reject devnum == 0.
+        for bus in 1..4 {
+            for port in 1..50u8 {
+                for addr in 1..10u8 {
+                    let (_b, d) =
+                        derive_bus_dev_inner(&bus.to_string(), &[port, port ^ 0x55], addr);
+                    assert!(d >= 1, "devnum must be >=1");
+                    assert!(d <= 0x7FFF, "devnum must fit 15 bits");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn derive_bus_dev_distinguishes_buses() {
+        let a = derive_bus_dev_inner("1", &[1, 2], 3);
+        let b = derive_bus_dev_inner("2", &[1, 2], 3);
+        assert_ne!(a.0, b.0, "bus tokens must differ across buses");
     }
 }
