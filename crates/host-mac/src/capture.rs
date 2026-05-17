@@ -118,6 +118,16 @@ struct IOUSBDeviceVTable {
     usb_device_reenumerate: ReEnumFn,  // 37 USBDeviceReEnumerate
 }
 
+// Compile-time guard against accidental layout drift: every slot in the
+// vtable above must be exactly one pointer wide, and there must be 38
+// of them (indices 0..=37). If anyone adds or removes a field without
+// updating Apple's `IOUSBDeviceStruct500` layout assumption, this fails
+// to compile.
+const _: () = assert!(
+    std::mem::size_of::<IOUSBDeviceVTable>() == 38 * std::mem::size_of::<*mut c_void>(),
+    "IOUSBDeviceVTable layout drifted from IOUSBDeviceStruct500"
+);
+
 #[repr(C)]
 struct IOCFPlugInVTable {
     _reserved: Opaque,

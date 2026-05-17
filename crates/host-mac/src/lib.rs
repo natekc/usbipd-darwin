@@ -359,6 +359,11 @@ pub struct OpenedDevice {
     /// `reenumerate_release` on drop.
     #[cfg(target_os = "macos")]
     captured_registry_id: Option<u64>,
+    /// VID/PID captured at open time, used to verify on drop that we are
+    /// releasing the *same* device and not some unrelated device that
+    /// happens to have been plugged into the same port in the meantime.
+    #[cfg(target_os = "macos")]
+    captured_vid_pid: Option<(u16, u16)>,
 }
 
 #[cfg(target_os = "macos")]
@@ -382,15 +387,42 @@ impl Drop for OpenedDevice {
             // at open time), so we need to find the *current* registry id
             // by location_id. Best-effort: log and move on if anything
             // fails — the user's worst case is having to unplug + replug.
-            let location_id = nusb::list_devices()
+            //
+            // Cross-check VID/PID before issuing the release, because a
+            // user could in principle unplug the captured device and
+            // plug a different device into the same port between open
+            // and drop. Releasing the wrong device would yank kernel
+            // drivers off whatever's currently sitting at that port.
+            let candidate = nusb::list_devices()
                 .wait()
                 .ok()
-                .and_then(|mut it| it.find(|i| format_busid(i) == self.busid))
-                .map(|i| (i.registry_entry_id(), i.location_id()));
-            let target = location_id.map_or(reg_id, |(rid, _)| rid);
+                .and_then(|mut it| it.find(|i| format_busid(i) == self.busid));
+            let target = match (&candidate, self.captured_vid_pid) {
+                (Some(info), Some((vid, pid)))
+                    if info.vendor_id() == vid && info.product_id() == pid =>
+                {
+                    info.registry_entry_id()
+                }
+                (Some(info), None) => info.registry_entry_id(),
+                (Some(info), Some((vid, pid))) => {
+                    warn!(
+                        busid = %self.busid,
+                        expected = format!("{vid:04x}:{pid:04x}"),
+                        got = format!("{:04x}:{:04x}", info.vendor_id(), info.product_id()),
+                        "skipping reenumerate_release: device at port has different VID:PID"
+                    );
+                    return;
+                }
+                (None, _) => {
+                    // Device gone entirely — nothing to release.
+                    debug!(busid = %self.busid, "device gone at drop, skipping release");
+                    return;
+                }
+            };
             debug!(
                 busid = %self.busid,
                 target = format!("{target:#x}"),
+                fallback_from = format!("{reg_id:#x}"),
                 "releasing force-captured device"
             );
             if let Err(e) = capture::reenumerate_release(target) {
@@ -432,6 +464,9 @@ impl OpenedDevice {
 
         let (busnum, devnum) = derive_bus_dev(&info);
         let devid = (busnum << 16) | devnum;
+        #[cfg(target_os = "macos")]
+        let captured_vid_pid = captured_registry_id
+            .map(|_| (info.vendor_id(), info.product_id()));
         let device = info.open().wait()?;
         Ok(Self {
             busid: busid.to_owned(),
@@ -442,6 +477,8 @@ impl OpenedDevice {
             endpoints: RwLock::new(HashMap::new()),
             #[cfg(target_os = "macos")]
             captured_registry_id,
+            #[cfg(target_os = "macos")]
+            captured_vid_pid,
         })
     }
 
