@@ -8,9 +8,10 @@ use anyhow::{Context, Result, anyhow};
 use clap::{Parser, Subcommand};
 use std::collections::HashSet;
 use std::net::SocketAddr;
+use std::path::PathBuf;
 use tracing_subscriber::EnvFilter;
 
-use daemon::{AccessPolicy, DaemonConfig};
+use daemon::{AccessPolicy, DaemonConfig, Endpoint};
 
 /// Default TCP port for USB/IP. Matches the IANA registration and the
 /// hard-coded default in the Linux `usbipd` and `usbip` utilities.
@@ -34,12 +35,21 @@ enum Cmd {
     /// `--allow-all` to skip filtering) to actually export devices, and
     /// `--allow-public` to accept binding to a non-loopback address.
     Daemon {
-        /// Address and port to listen on.
+        /// TCP address and port to listen on.
         ///
         /// Defaults to 127.0.0.1. Any non-loopback address requires
-        /// `--allow-public` as a separate acknowledgement.
-        #[arg(long, default_value_t = SocketAddr::from(([127, 0, 0, 1], DEFAULT_PORT)))]
+        /// `--allow-public` as a separate acknowledgement. Mutually
+        /// exclusive with `--socket`.
+        #[arg(long, default_value_t = SocketAddr::from(([127, 0, 0, 1], DEFAULT_PORT)), conflicts_with = "socket")]
         listen: SocketAddr,
+
+        /// Unix-domain socket path to listen on instead of TCP. The
+        /// socket is created with mode 0600 (owner-only) so the only
+        /// access control needed is filesystem permissions on the
+        /// socket path. Intended for integrations like Lima that
+        /// forward USB/IP over an already-authenticated transport.
+        #[arg(long, value_name = "PATH")]
+        socket: Option<PathBuf>,
 
         /// Allow a specific (VendorID:ProductID) pair. Hex, no `0x` prefix.
         /// Example: `--allow 1050:0407` (`YubiKey` 5).
@@ -52,10 +62,11 @@ enum Cmd {
         #[arg(long, conflicts_with = "allow")]
         allow_all: bool,
 
-        /// Permit binding `--listen` to a non-loopback address. The
-        /// USB/IP protocol is unauthenticated; the only legitimate
-        /// reason to set this is when fronting the daemon with a
-        /// firewall or VPN that supplies its own access control.
+        /// Permit binding `--listen` to a non-loopback TCP address.
+        /// Ignored when `--socket` is used. The USB/IP protocol is
+        /// unauthenticated; the only legitimate reason to set this is
+        /// when fronting the daemon with a firewall or VPN that
+        /// supplies its own access control.
         #[arg(long)]
         allow_public: bool,
     },
@@ -94,6 +105,7 @@ fn main() -> Result<()> {
         Cmd::List => list(),
         Cmd::Daemon {
             listen,
+            socket,
             allow,
             allow_all,
             allow_public,
@@ -105,8 +117,12 @@ fn main() -> Result<()> {
             } else {
                 AccessPolicy::AllowList(allow.into_iter().collect::<HashSet<_>>())
             };
+            let endpoint = match socket {
+                Some(path) => Endpoint::Unix(path),
+                None => Endpoint::Tcp(listen),
+            };
             daemon::run(DaemonConfig {
-                listen,
+                endpoint,
                 policy,
                 allow_public_bind: allow_public,
             })

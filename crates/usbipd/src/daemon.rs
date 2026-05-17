@@ -28,14 +28,14 @@
 use anyhow::{Context, Result, anyhow};
 use host_mac::{OpenedDevice, SetupPacket, UsbDevice};
 use std::collections::{HashMap, HashSet};
+use std::fmt;
 use std::net::SocketAddr;
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::TcpListener;
-use tokio::net::TcpStream;
-use tokio::net::tcp::OwnedWriteHalf;
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
+use tokio::net::{TcpListener, UnixListener, UnixStream};
 use tokio::sync::{Mutex as AsyncMutex, Semaphore};
 use tokio::task::AbortHandle;
 use tracing::{debug, info, warn};
@@ -46,6 +46,12 @@ use usbip_proto::{
     write_ret_unlink,
 };
 use usbip_server::{Reply, encode_rep_devlist, handle_op, to_exported};
+
+/// Boxed trait object for the read half of a session.
+type BoxRead = Box<dyn AsyncRead + Send + Unpin>;
+/// Boxed trait object for the write half of a session, shared across the
+/// `urb_loop` task and every spawned per-URB task behind a tokio mutex.
+type SharedWriter = Arc<AsyncMutex<Box<dyn AsyncWrite + Send + Unpin>>>;
 
 /// Per-URB transfer timeout. Long enough for slow bulk operations on large
 /// mass-storage SCSI commands; short enough that a wedged device will free
@@ -107,9 +113,9 @@ impl AccessPolicy {
 /// Configuration for [`run`]. Constructed by the CLI.
 #[derive(Debug, Clone)]
 pub struct DaemonConfig {
-    pub listen: SocketAddr,
+    pub endpoint: Endpoint,
     pub policy: AccessPolicy,
-    /// If `false` (the default), binding to any address other than
+    /// If `false` (the default), binding to any TCP address other than
     /// loopback returns an error. Set to `true` from the CLI flag
     /// `--allow-public` after the user has acknowledged the consequence.
     pub allow_public_bind: bool,
@@ -118,10 +124,40 @@ pub struct DaemonConfig {
 impl Default for DaemonConfig {
     fn default() -> Self {
         Self {
-            listen: SocketAddr::from(([127, 0, 0, 1], 3240)),
+            endpoint: Endpoint::Tcp(SocketAddr::from(([127, 0, 0, 1], 3240))),
             policy: AccessPolicy::default(),
             allow_public_bind: false,
         }
+    }
+}
+
+/// Where the daemon accepts connections from. TCP for the canonical
+/// USB/IP wire format on the standard port; Unix-domain socket for
+/// integrations (Lima, vsock-forwarders, …) that want filesystem-level
+/// access control instead of network exposure.
+#[derive(Debug, Clone)]
+pub enum Endpoint {
+    Tcp(SocketAddr),
+    Unix(PathBuf),
+}
+
+impl fmt::Display for Endpoint {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Tcp(a) => write!(f, "tcp://{a}"),
+            Self::Unix(p) => write!(f, "unix://{}", p.display()),
+        }
+    }
+}
+
+/// Human-readable label for the remote side of a session. We don't
+/// otherwise care about IP vs uid; this is just used for log messages.
+#[derive(Debug, Clone)]
+struct Peer(String);
+
+impl fmt::Display for Peer {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.0)
     }
 }
 
@@ -132,7 +168,7 @@ struct DaemonState {
     /// Devices currently held open by a client, keyed by busid. The
     /// value is the peer address for diagnostics. Used to refuse a
     /// second concurrent import of the same device.
-    attached: std::sync::Mutex<HashMap<String, SocketAddr>>,
+    attached: std::sync::Mutex<HashMap<String, Peer>>,
 }
 
 impl DaemonState {
@@ -146,12 +182,12 @@ impl DaemonState {
     /// Try to claim `busid` for `peer`. Returns `Some(guard)` on success,
     /// `None` if another client already has it open. The guard releases
     /// the slot on drop.
-    fn try_attach(self: &Arc<Self>, busid: &str, peer: SocketAddr) -> Option<AttachGuard> {
+    fn try_attach(self: &Arc<Self>, busid: &str, peer: &Peer) -> Option<AttachGuard> {
         let mut map = self.attached.lock().expect("attached map poisoned");
         if map.contains_key(busid) {
             return None;
         }
-        map.insert(busid.to_owned(), peer);
+        map.insert(busid.to_owned(), peer.clone());
         Some(AttachGuard {
             state: Arc::clone(self),
             busid: busid.to_owned(),
@@ -183,12 +219,13 @@ pub fn run(config: DaemonConfig) -> Result<()> {
 }
 
 async fn serve(config: DaemonConfig) -> Result<()> {
-    if !is_loopback(&config.listen) && !config.allow_public_bind {
-        return Err(anyhow!(
-            "refusing to bind {}: USB/IP has no authentication. \
-             Re-run with --allow-public if you really mean to expose USB devices to the network.",
-            config.listen
-        ));
+    if let Endpoint::Tcp(addr) = &config.endpoint {
+        if !is_loopback(addr) && !config.allow_public_bind {
+            return Err(anyhow!(
+                "refusing to bind {addr}: USB/IP has no authentication. \
+                 Re-run with --allow-public if you really mean to expose USB devices to the network."
+            ));
+        }
     }
     if matches!(config.policy, AccessPolicy::AllowAll) {
         warn!(
@@ -204,30 +241,69 @@ async fn serve(config: DaemonConfig) -> Result<()> {
     }
     let state = Arc::new(DaemonState::new(config.policy.clone()));
 
-    let listener = TcpListener::bind(config.listen)
-        .await
-        .with_context(|| format!("bind {}", config.listen))?;
-    info!(listen = %config.listen, "usbipd listening");
-
     let shutdown = tokio::signal::ctrl_c();
     tokio::pin!(shutdown);
 
+    info!(endpoint = %config.endpoint, "usbipd listening");
+
+    match &config.endpoint {
+        Endpoint::Tcp(addr) => {
+            let listener = TcpListener::bind(addr)
+                .await
+                .with_context(|| format!("bind {addr}"))?;
+            accept_loop_tcp(listener, &state, &mut shutdown).await
+        }
+        Endpoint::Unix(path) => {
+            // Remove any leftover socket from a previous run. Hard-fail
+            // if the path exists but is not a socket — we don't want to
+            // overwrite a regular file.
+            if let Ok(meta) = std::fs::symlink_metadata(path) {
+                use std::os::unix::fs::FileTypeExt;
+                if !meta.file_type().is_socket() {
+                    return Err(anyhow!(
+                        "{} exists and is not a socket; refusing to overwrite",
+                        path.display()
+                    ));
+                }
+                let _ = std::fs::remove_file(path);
+            }
+            let listener = UnixListener::bind(path)
+                .with_context(|| format!("bind unix:{}", path.display()))?;
+            // Tighten permissions: only the owning user should be able to
+            // connect. Filesystem permissions are the only access control
+            // a unix-socket transport offers.
+            if let Err(e) = std::fs::set_permissions(path, unix_mode(0o600))
+            {
+                warn!(error = %e, "could not chmod 0600 on socket; access will fall back to umask");
+            }
+            accept_loop_unix(listener, path.clone(), &state, &mut shutdown).await
+        }
+    }
+}
+
+async fn accept_loop_tcp(
+    listener: TcpListener,
+    state: &Arc<DaemonState>,
+    shutdown: &mut std::pin::Pin<&mut impl std::future::Future<Output = std::io::Result<()>>>,
+) -> Result<()> {
     loop {
         tokio::select! {
-            res = listener.accept() => {
-                match res {
-                    Ok((stream, peer)) => {
-                        let state = Arc::clone(&state);
-                        tokio::spawn(async move {
-                            if let Err(e) = handle_client(stream, peer, state).await {
-                                warn!(%peer, error = %e, "client session ended with error");
-                            }
-                        });
-                    }
-                    Err(e) => warn!(error = %e, "accept failed"),
+            res = listener.accept() => match res {
+                Ok((stream, addr)) => {
+                    let peer = Peer(format!("tcp:{addr}"));
+                    let state = Arc::clone(state);
+                    tokio::spawn(async move {
+                        let (r, w) = stream.into_split();
+                        let reader: BoxRead = Box::new(r);
+                        let writer: SharedWriter = Arc::new(AsyncMutex::new(Box::new(w)));
+                        if let Err(e) = handle_session(reader, writer, peer.clone(), state).await {
+                            warn!(%peer, error = %e, "client session ended with error");
+                        }
+                    });
                 }
-            }
-            _ = &mut shutdown => {
+                Err(e) => warn!(error = %e, "accept failed"),
+            },
+            _ = &mut *shutdown => {
                 info!("ctrl-c received, shutting down");
                 return Ok(());
             }
@@ -235,18 +311,69 @@ async fn serve(config: DaemonConfig) -> Result<()> {
     }
 }
 
+async fn accept_loop_unix(
+    listener: UnixListener,
+    path: PathBuf,
+    state: &Arc<DaemonState>,
+    shutdown: &mut std::pin::Pin<&mut impl std::future::Future<Output = std::io::Result<()>>>,
+) -> Result<()> {
+    let result = loop {
+        tokio::select! {
+            res = listener.accept() => match res {
+                Ok((stream, _)) => {
+                    let peer = unix_peer_label(&stream);
+                    let state = Arc::clone(state);
+                    tokio::spawn(async move {
+                        let (r, w) = stream.into_split();
+                        let reader: BoxRead = Box::new(r);
+                        let writer: SharedWriter = Arc::new(AsyncMutex::new(Box::new(w)));
+                        if let Err(e) = handle_session(reader, writer, peer.clone(), state).await {
+                            warn!(%peer, error = %e, "client session ended with error");
+                        }
+                    });
+                }
+                Err(e) => warn!(error = %e, "accept failed"),
+            },
+            _ = &mut *shutdown => {
+                info!("ctrl-c received, shutting down");
+                break Ok(());
+            }
+        }
+    };
+    let _ = std::fs::remove_file(&path);
+    result
+}
+
+fn unix_peer_label(stream: &UnixStream) -> Peer {
+    if let Ok(cred) = stream.peer_cred() {
+        Peer(format!(
+            "unix:uid={},pid={}",
+            cred.uid(),
+            cred.pid().unwrap_or(0)
+        ))
+    } else {
+        Peer("unix:unknown".into())
+    }
+}
+
 fn is_loopback(addr: &SocketAddr) -> bool {
     addr.ip().is_loopback()
 }
 
-async fn handle_client(
-    mut stream: TcpStream,
-    peer: SocketAddr,
+fn unix_mode(bits: u32) -> std::fs::Permissions {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::Permissions::from_mode(bits)
+}
+
+async fn handle_session(
+    mut reader: BoxRead,
+    writer: SharedWriter,
+    peer: Peer,
     state: Arc<DaemonState>,
 ) -> Result<()> {
     debug!(%peer, "client connected");
     let mut header_buf = [0u8; OpHeader::SIZE];
-    stream
+    reader
         .read_exact(&mut header_buf)
         .await
         .with_context(|| format!("read op header from {peer}"))?;
@@ -264,16 +391,15 @@ async fn handle_client(
     }
 
     match header.code {
-        OP_REQ_DEVLIST => handle_devlist(stream, peer, &state).await,
-        OP_REQ_IMPORT => handle_import(stream, peer, &state).await,
+        OP_REQ_DEVLIST => handle_devlist(&writer, &peer, &state).await,
+        OP_REQ_IMPORT => handle_import(reader, writer, peer, &state).await,
         _ => {
-            // Reuse the legacy handler for symmetry/logging.
             let devices = host_mac::list_devices().context("enumerate USB devices")?;
-            let filtered = state.policy.filter(&devices);
-            let owned: Vec<UsbDevice> = filtered.into_iter().cloned().collect();
+            let owned: Vec<UsbDevice> =
+                state.policy.filter(&devices).into_iter().cloned().collect();
             match handle_op(header, &owned)? {
                 Reply::Bytes(bytes) => {
-                    stream.write_all(&bytes).await?;
+                    writer.lock().await.write_all(&bytes).await?;
                 }
                 Reply::Unsupported(code) => {
                     warn!(%peer, code = format!("0x{code:04x}"), "unsupported op code; closing");
@@ -285,44 +411,44 @@ async fn handle_client(
 }
 
 async fn handle_devlist(
-    mut stream: TcpStream,
-    peer: SocketAddr,
+    writer: &SharedWriter,
+    peer: &Peer,
     state: &Arc<DaemonState>,
 ) -> Result<()> {
     let devices = host_mac::list_devices().context("enumerate USB devices")?;
     let filtered: Vec<UsbDevice> = state.policy.filter(&devices).into_iter().cloned().collect();
     let bytes = encode_rep_devlist(&filtered);
-    stream
-        .write_all(&bytes)
-        .await
-        .with_context(|| format!("write devlist to {peer}"))?;
-    stream.flush().await.ok();
+    {
+        let mut w = writer.lock().await;
+        w.write_all(&bytes)
+            .await
+            .with_context(|| format!("write devlist to {peer}"))?;
+        w.flush().await.ok();
+    }
     debug!(%peer, bytes = bytes.len(), exported = filtered.len(), total = devices.len(), "devlist sent");
     Ok(())
 }
 
 async fn handle_import(
-    mut stream: TcpStream,
-    peer: SocketAddr,
+    mut reader: BoxRead,
+    writer: SharedWriter,
+    peer: Peer,
     state: &Arc<DaemonState>,
 ) -> Result<()> {
     let mut busid_buf = [0u8; 32];
-    stream
+    reader
         .read_exact(&mut busid_buf)
         .await
         .with_context(|| format!("read import busid from {peer}"))?;
     let busid = decode_req_import_busid(&busid_buf)?;
     info!(%peer, %busid, "OP_REQ_IMPORT");
 
-    // Find the device in the current list so we can echo its descriptor
-    // fields back in the import reply.
     let devices = host_mac::list_devices().context("enumerate USB devices")?;
     let Some(desc) = devices.into_iter().find(|d| d.busid == busid) else {
         warn!(%peer, %busid, "import: device not found");
-        return send_import_err(&mut stream).await;
+        return send_import_err(&writer).await;
     };
 
-    // Policy gate: refuse to even open a non-allow-listed device.
     if !state.policy.permits(desc.vendor_id, desc.product_id) {
         warn!(
             %peer,
@@ -331,28 +457,25 @@ async fn handle_import(
             pid = format!("{:04x}", desc.product_id),
             "import: device not in allow-list, refusing"
         );
-        return send_import_err(&mut stream).await;
+        return send_import_err(&writer).await;
     }
 
-    // Mutex gate: a device can only be opened by one client at a time
-    // (force-capture is process-exclusive on macOS anyway).
-    let Some(_attach_guard) = state.try_attach(&busid, peer) else {
+    let Some(_attach_guard) = state.try_attach(&busid, &peer) else {
         let holder = state
             .attached
             .lock()
             .expect("attached map poisoned")
             .get(&busid)
-            .copied();
+            .cloned();
         warn!(
             %peer,
             %busid,
             holder = ?holder,
             "import: device is already attached to another client, refusing"
         );
-        return send_import_err(&mut stream).await;
+        return send_import_err(&writer).await;
     };
 
-    // Open the device on a blocking thread (nusb is sync).
     let opened = match tokio::task::spawn_blocking({
         let busid = busid.clone();
         move || OpenedDevice::open(&busid)
@@ -363,15 +486,11 @@ async fn handle_import(
         Ok(d) => Arc::new(d),
         Err(e) => {
             warn!(%peer, %busid, error = %e, "import: open failed");
-            return send_import_err(&mut stream).await;
+            return send_import_err(&writer).await;
         }
     };
     info!(%peer, %busid, "device opened, entering URB loop");
 
-    // Fold the snapshot (real bConfigurationValue / bNumConfigurations
-    // from the opened device, and the deterministic busnum/devnum from
-    // OpenedDevice) into the pre-import enumeration entry, which has
-    // the descriptor strings.
     let snap = opened.descriptor_snapshot();
     let desc = UsbDevice {
         busid: snap.busid.clone(),
@@ -387,32 +506,30 @@ async fn handle_import(
         ..desc
     };
 
-    // Send success import reply.
     let mut out = Vec::with_capacity(8 + 312);
     encode_rep_import_ok(&mut out, &to_exported(&desc));
-    stream.write_all(&out).await?;
+    writer.lock().await.write_all(&out).await?;
 
     // _attach_guard drops at end of scope, freeing the device for re-attachment.
-    urb_loop(stream, peer, desc, opened).await
+    urb_loop(reader, writer, peer, desc, opened).await
 }
 
-async fn send_import_err(stream: &mut TcpStream) -> Result<()> {
+async fn send_import_err(writer: &SharedWriter) -> Result<()> {
     let mut out = Vec::new();
     encode_rep_import_err(&mut out);
-    stream.write_all(&out).await.ok();
+    writer.lock().await.write_all(&out).await.ok();
     Ok(())
 }
 
 #[allow(clippy::too_many_lines)]
 async fn urb_loop(
-    stream: TcpStream,
-    peer: SocketAddr,
+    mut reader: BoxRead,
+    writer: SharedWriter,
+    peer: Peer,
     desc: UsbDevice,
     opened: Arc<OpenedDevice>,
 ) -> Result<()> {
     let devid = (desc.busnum << 16) | desc.devnum;
-    let (mut reader, writer) = stream.into_split();
-    let writer: Arc<AsyncMutex<OwnedWriteHalf>> = Arc::new(AsyncMutex::new(writer));
     let inflight: Arc<std::sync::Mutex<HashMap<u32, Inflight>>> =
         Arc::new(std::sync::Mutex::new(HashMap::new()));
     let permits = Arc::new(Semaphore::new(MAX_INFLIGHT_URBS));
@@ -564,7 +681,7 @@ struct Inflight {
 
 async fn run_submit(
     opened: Arc<OpenedDevice>,
-    writer: Arc<AsyncMutex<OwnedWriteHalf>>,
+    writer: SharedWriter,
     basic: UrbHeader,
     cmd: CmdSubmit,
     out_payload: Vec<u8>,
@@ -695,17 +812,17 @@ mod tests {
     #[test]
     fn try_attach_is_mutually_exclusive_per_busid() {
         let state = Arc::new(DaemonState::new(AccessPolicy::AllowAll));
-        let peer1: SocketAddr = "127.0.0.1:1111".parse().unwrap();
-        let peer2: SocketAddr = "127.0.0.1:2222".parse().unwrap();
-        let g1 = state.try_attach("01-1", peer1);
+        let peer1 = Peer("tcp:127.0.0.1:1111".into());
+        let peer2 = Peer("tcp:127.0.0.1:2222".into());
+        let g1 = state.try_attach("01-1", &peer1);
         assert!(g1.is_some(), "first client should win");
-        let g2 = state.try_attach("01-1", peer2);
+        let g2 = state.try_attach("01-1", &peer2);
         assert!(g2.is_none(), "second concurrent client should be refused");
         // A *different* busid should still succeed.
-        let g3 = state.try_attach("01-2", peer2);
+        let g3 = state.try_attach("01-2", &peer2);
         assert!(g3.is_some());
         drop(g1);
-        let g4 = state.try_attach("01-1", peer2);
+        let g4 = state.try_attach("01-1", &peer2);
         assert!(g4.is_some(), "should be re-attachable after first guard dropped");
     }
 
