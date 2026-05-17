@@ -1,0 +1,59 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+    LaunchDaemon for usbipd-mac.
+
+    Installed at:  /Library/LaunchDaemons/io.usbipd.daemon.plist
+    Owned by:      root:wheel
+    Mode:          0644
+
+    Loads with:    sudo launchctl bootstrap system /Library/LaunchDaemons/io.usbipd.daemon.plist
+    Unloads with:  sudo launchctl bootout  system /Library/LaunchDaemons/io.usbipd.daemon.plist
+
+    Edit ProgramArguments to set your allow-list and listen mode
+    (TCP loopback by default; switch to --socket for unix-domain).
+-->
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>io.usbipd.daemon</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>/usr/local/bin/usbipd</string>
+        <string>daemon</string>
+        <!-- Pick ONE access policy. -->
+        <!-- <string>- -allow-all</string> -->
+        <!-- <string>- -allow</string><string>1050:0407</string> -->
+        <!-- Pick ONE listen endpoint. -->
+        <string>--listen</string>
+        <string>127.0.0.1:3240</string>
+        <!-- <string>- -socket</string><string>/var/run/usbipd.sock</string> -->
+    </array>
+
+    <key>UserName</key>
+    <string>root</string>
+
+    <key>GroupName</key>
+    <string>wheel</string>
+
+    <!-- Restart automatically if it crashes. -->
+    <key>KeepAlive</key>
+    <true/>
+
+    <!-- Cap restart rate so a configuration-induced crash loop is observable. -->
+    <key>ThrottleInterval</key>
+    <integer>10</integer>
+
+    <key>StandardOutPath</key>
+    <string>/var/log/usbipd.log</string>
+    <key>StandardErrorPath</key>
+    <string>/var/log/usbipd.log</string>
+
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>RUST_LOG</key>
+        <string>info</string>
+    </dict>
+</dict>
+</plist>

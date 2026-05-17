@@ -1,0 +1,18 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+    Entitlements for the codesigned usbipd binary.
+
+    Empty by design: usbipd uses IOKit USBDeviceReEnumerate for
+    force-capture, which works for any root process. Unlike DriverKit,
+    it does NOT require an Apple-issued entitlement.
+
+    We sign with an empty entitlements file (rather than no entitlements
+    file at all) so that hardened-runtime is enabled — `codesign -o
+    runtime` is required for notarization, and notarization is required
+    if we ever distribute pre-built binaries.
+-->
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+</dict>
+</plist>
