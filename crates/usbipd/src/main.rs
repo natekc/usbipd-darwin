@@ -33,6 +33,25 @@ fn main() -> Result<()> {
 }
 
 fn list() -> Result<()> {
-    println!("usbipd list: not implemented yet (MVP-1)");
+    let devices = host_mac::list_devices()?;
+    println!("Local USB devices");
+    println!("=================");
+    if devices.is_empty() {
+        println!(" (none)");
+        return Ok(());
+    }
+    for d in &devices {
+        let vendor = d.manufacturer.as_deref().unwrap_or("(unknown vendor)");
+        let product = d.product.as_deref().unwrap_or("(unknown product)");
+        println!(
+            " - busid {} ({:04x}:{:04x})",
+            d.busid, d.vendor_id, d.product_id
+        );
+        println!("     {vendor} : {product}");
+        println!(
+            "     class={:02x}/{:02x}/{:02x}",
+            d.class, d.subclass, d.protocol
+        );
+    }
     Ok(())
 }
