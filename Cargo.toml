@@ -6,6 +6,9 @@ members = [
     "crates/usbip-server",
     "crates/usbipd",
 ]
+exclude = [
+    "crates/usbip-proto/fuzz",
+]
 
 [workspace.package]
 version = "0.0.1"

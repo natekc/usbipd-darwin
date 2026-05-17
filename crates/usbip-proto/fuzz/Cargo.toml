@@ -1,0 +1,42 @@
+[package]
+name = "usbip-proto-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2024"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+usbip-proto = { path = ".." }
+
+# Each fuzz target is a free-standing binary. Keep them small and
+# focused on a single decoder: any panic on arbitrary input is a bug.
+[[bin]]
+name = "op_header"
+path = "fuzz_targets/op_header.rs"
+test = false
+doc  = false
+bench = false
+
+[[bin]]
+name = "cmd_submit"
+path = "fuzz_targets/cmd_submit.rs"
+test = false
+doc  = false
+bench = false
+
+[[bin]]
+name = "urb_header"
+path = "fuzz_targets/urb_header.rs"
+test = false
+doc  = false
+bench = false
+
+[[bin]]
+name = "req_import_busid"
+path = "fuzz_targets/req_import_busid.rs"
+test = false
+doc  = false
+bench = false
