@@ -10,11 +10,17 @@
 
 use anyhow::{Context, Result, anyhow};
 use host_mac::{OpenedDevice, SetupPacket, UsbDevice};
+use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::{TcpListener, TcpStream};
+use tokio::net::TcpStream;
+use tokio::net::tcp::OwnedWriteHalf;
+use tokio::net::TcpListener;
+use tokio::sync::{Mutex as AsyncMutex, Semaphore};
+use tokio::task::AbortHandle;
 use tracing::{debug, info, warn};
 use usbip_proto::{
     CmdSubmit, CmdUnlink, OP_REQ_DEVLIST, OP_REQ_IMPORT, OpHeader, RetSubmit, URB_HEADER_SIZE,
@@ -27,6 +33,11 @@ use usbip_server::{Reply, encode_rep_devlist, handle_op, to_exported};
 /// mass-storage SCSI commands; short enough that a wedged device will free
 /// the connection within a minute.
 const URB_TIMEOUT: Duration = Duration::from_secs(60);
+
+/// Per-connection cap on in-flight `CMD_SUBMIT` URBs. Bounds the daemon's
+/// blocking-thread footprint when a misbehaving client floods submits
+/// without ever reading replies.
+const MAX_INFLIGHT_URBS: usize = 256;
 
 /// Linux errno values used in `RET_SUBMIT.status` on failure.
 const EPIPE: i32 = -32;
@@ -178,113 +189,219 @@ async fn handle_import(mut stream: TcpStream, peer: SocketAddr) -> Result<()> {
     urb_loop(stream, peer, desc, opened).await
 }
 
+#[allow(clippy::too_many_lines)]
 async fn urb_loop(
-    mut stream: TcpStream,
+    stream: TcpStream,
     peer: SocketAddr,
     desc: UsbDevice,
     opened: Arc<OpenedDevice>,
 ) -> Result<()> {
     let devid = (desc.busnum << 16) | desc.devnum;
+    let (mut reader, writer) = stream.into_split();
+    let writer: Arc<AsyncMutex<OwnedWriteHalf>> = Arc::new(AsyncMutex::new(writer));
+    let inflight: Arc<std::sync::Mutex<HashMap<u32, Inflight>>> =
+        Arc::new(std::sync::Mutex::new(HashMap::new()));
+    let permits = Arc::new(Semaphore::new(MAX_INFLIGHT_URBS));
+
     let mut header_buf = [0u8; URB_HEADER_SIZE];
-    loop {
+    let result: Result<()> = loop {
         // EOF here means clean client disconnect.
-        if let Err(e) = stream.read_exact(&mut header_buf).await {
+        if let Err(e) = reader.read_exact(&mut header_buf).await {
             if e.kind() == std::io::ErrorKind::UnexpectedEof {
                 debug!(%peer, "client disconnected");
-                return Ok(());
+                break Ok(());
             }
-            return Err(e).context("read URB header");
+            break Err(anyhow::Error::from(e).context("read URB header"));
         }
-        let basic = UrbHeader::decode(&header_buf[0..UrbHeader::SIZE])?;
+        let basic = match UrbHeader::decode(&header_buf[0..UrbHeader::SIZE]) {
+            Ok(b) => b,
+            Err(e) => break Err(anyhow::Error::from(e).context("decode URB header")),
+        };
         if basic.devid != devid {
             warn!(
                 %peer,
                 got = format!("0x{:08x}", basic.devid),
                 expected = format!("0x{devid:08x}"),
-                "URB devid mismatch; ignoring"
+                "URB devid mismatch; closing connection"
             );
+            break Err(anyhow!("URB devid mismatch"));
         }
 
         match basic.command {
             USBIP_CMD_SUBMIT => {
-                let cmd = CmdSubmit::decode(&header_buf[UrbHeader::SIZE..URB_HEADER_SIZE])?;
-                handle_submit(&mut stream, &opened, basic, cmd).await?;
+                let cmd = match CmdSubmit::decode(&header_buf[UrbHeader::SIZE..URB_HEADER_SIZE]) {
+                    Ok(c) => c,
+                    Err(e) => break Err(anyhow::Error::from(e).context("decode CMD_SUBMIT")),
+                };
+                // For OUT transfers the client sends the payload right after
+                // the header — must consume it serially before spawning the
+                // transfer task (we have only one reader).
+                let dir_in = basic.direction == USBIP_DIR_IN;
+                let tbl = usize::try_from(cmd.transfer_buffer_length).unwrap_or(0);
+                let mut out_payload = Vec::new();
+                if !dir_in && tbl > 0 {
+                    out_payload.resize(tbl, 0);
+                    if let Err(e) = reader.read_exact(&mut out_payload).await {
+                        break Err(anyhow::Error::from(e).context("read OUT payload"));
+                    }
+                }
+
+                let ep_addr = if basic.ep == 0 {
+                    0
+                } else {
+                    u8::try_from(basic.ep & 0xF).unwrap_or(0)
+                        | if dir_in { 0x80 } else { 0x00 }
+                };
+                let cancelled = Arc::new(AtomicBool::new(false));
+                // Acquire a permit before spawning so a flooding client
+                // back-pressures the read loop.
+                let Ok(permit) = Arc::clone(&permits).acquire_owned().await else {
+                    break Err(anyhow!("semaphore closed"));
+                };
+                let opened2 = Arc::clone(&opened);
+                let writer2 = Arc::clone(&writer);
+                let inflight2 = Arc::clone(&inflight);
+                let cancelled2 = Arc::clone(&cancelled);
+                let seqnum = basic.seqnum;
+                let handle = tokio::spawn(async move {
+                    let _permit = permit;
+                    run_submit(opened2, writer2, basic, cmd, out_payload, cancelled2).await;
+                    inflight2
+                        .lock()
+                        .expect("inflight map poisoned")
+                        .remove(&seqnum);
+                });
+                inflight
+                    .lock()
+                    .expect("inflight map poisoned")
+                    .insert(seqnum, Inflight {
+                        abort: handle.abort_handle(),
+                        ep_addr,
+                        cancelled,
+                    });
             }
             USBIP_CMD_UNLINK => {
-                let unlink = CmdUnlink::decode(&header_buf[UrbHeader::SIZE..URB_HEADER_SIZE])?;
+                let unlink = match CmdUnlink::decode(
+                    &header_buf[UrbHeader::SIZE..URB_HEADER_SIZE],
+                ) {
+                    Ok(u) => u,
+                    Err(e) => break Err(anyhow::Error::from(e).context("decode CMD_UNLINK")),
+                };
+                // Look up the target SUBMIT, mark it cancelled, force its
+                // in-flight nusb call to return early via cancel_endpoint,
+                // and abort the task so it never writes a RET_SUBMIT.
+                let status = {
+                    let mut map = inflight.lock().expect("inflight map poisoned");
+                    if let Some(info) = map.remove(&unlink.unlink_seqnum) {
+                        info.cancelled.store(true, Ordering::SeqCst);
+                        if info.ep_addr != 0 {
+                            opened.cancel_endpoint(info.ep_addr);
+                        }
+                        info.abort.abort();
+                        0
+                    } else {
+                        // The URB has already completed (or never existed).
+                        // Linux returns -ENOENT but most clients ignore the
+                        // status; stay quiet and report success.
+                        0
+                    }
+                };
                 debug!(
                     %peer,
                     seqnum = basic.seqnum,
                     unlink_seqnum = unlink.unlink_seqnum,
-                    "CMD_UNLINK (no-op, transfers are synchronous)"
+                    "CMD_UNLINK"
                 );
                 let mut out = Vec::with_capacity(URB_HEADER_SIZE);
-                write_ret_unlink(&mut out, basic.seqnum, 0);
-                stream.write_all(&out).await?;
+                write_ret_unlink(&mut out, basic.seqnum, status);
+                if let Err(e) = writer.lock().await.write_all(&out).await {
+                    break Err(anyhow::Error::from(e).context("write RET_UNLINK"));
+                }
             }
             other => {
-                return Err(anyhow!(
+                break Err(anyhow!(
                     "unknown URB command 0x{other:08x}; closing connection"
                 ));
             }
         }
+    };
+
+    // Drain in-flight tasks on disconnect so they don't keep firing into
+    // a dead socket. Aborting is fire-and-forget; tasks observe the
+    // cancelled flag and skip writing.
+    let pending: Vec<Inflight> = inflight
+        .lock()
+        .expect("inflight map poisoned")
+        .drain()
+        .map(|(_, v)| v)
+        .collect();
+    for info in pending {
+        info.cancelled.store(true, Ordering::SeqCst);
+        info.abort.abort();
     }
+    result
 }
 
-async fn handle_submit(
-    stream: &mut TcpStream,
-    opened: &Arc<OpenedDevice>,
+struct Inflight {
+    abort: AbortHandle,
+    ep_addr: u8,
+    cancelled: Arc<AtomicBool>,
+}
+
+async fn run_submit(
+    opened: Arc<OpenedDevice>,
+    writer: Arc<AsyncMutex<OwnedWriteHalf>>,
     basic: UrbHeader,
     cmd: CmdSubmit,
-) -> Result<()> {
+    out_payload: Vec<u8>,
+    cancelled: Arc<AtomicBool>,
+) {
     let dir_in = basic.direction == USBIP_DIR_IN;
     let tbl = usize::try_from(cmd.transfer_buffer_length).unwrap_or(0);
-
-    // For OUT transfers the client sends the payload right after the header.
-    let mut out_payload = Vec::new();
-    if !dir_in && tbl > 0 {
-        out_payload.resize(tbl, 0);
-        stream.read_exact(&mut out_payload).await?;
-    }
-
-    let opened = opened.clone();
     let ep = basic.ep;
     let seqnum = basic.seqnum;
 
     // Run the actual nusb call on a blocking thread.
-    let result = tokio::task::spawn_blocking(move || -> Result<(usize, Vec<u8>), host_mac::HostError> {
-        if ep == 0 {
-            let setup = SetupPacket::from_bytes(cmd.setup);
-            let data = opened.control_transfer(setup, &out_payload, URB_TIMEOUT)?;
-            // Control transfers report all-or-nothing; actual_length is
-            // the returned byte count for IN, or out_payload.len() for OUT.
-            let len = if dir_in { data.len() } else { out_payload.len() };
-            Ok((len, data))
-        } else {
-            let ep_addr = u8::try_from(ep & 0xF).unwrap_or(0) | if dir_in { 0x80 } else { 0x00 };
-            let r = opened.data_transfer(ep_addr, tbl, &out_payload, URB_TIMEOUT)?;
-            Ok((r.actual_length, r.data))
-        }
-    })
+    let result = match tokio::task::spawn_blocking(
+        move || -> Result<(usize, Vec<u8>), host_mac::HostError> {
+            if ep == 0 {
+                let setup = SetupPacket::from_bytes(cmd.setup);
+                let data = opened.control_transfer(setup, &out_payload, URB_TIMEOUT)?;
+                let len = if dir_in { data.len() } else { out_payload.len() };
+                Ok((len, data))
+            } else {
+                let ep_addr =
+                    u8::try_from(ep & 0xF).unwrap_or(0) | if dir_in { 0x80 } else { 0x00 };
+                let r = opened.data_transfer(ep_addr, tbl, &out_payload, URB_TIMEOUT)?;
+                Ok((r.actual_length, r.data))
+            }
+        },
+    )
     .await
-    .context("join transfer task")?;
+    {
+        Ok(r) => r,
+        Err(e) => {
+            warn!(seqnum, ep, error = %e, "transfer task join failed");
+            return;
+        }
+    };
+
+    // Cancelled by CMD_UNLINK: skip the reply entirely.
+    if cancelled.load(Ordering::SeqCst) {
+        debug!(seqnum, ep, "URB cancelled; no RET_SUBMIT");
+        return;
+    }
 
     let (status, actual_length, payload) = match result {
         Ok((actual, data)) => {
             if dir_in {
-                // Mass-storage and most other classes treat a short read as
-                // success — actual_length reflects the real byte count.
                 if data.len() > tbl {
-                    // Defensive: refuse to ship more than the client asked.
                     (EOVERFLOW, 0, Vec::new())
                 } else {
                     let actual_i32 = i32::try_from(actual).unwrap_or(i32::MAX);
                     (0, actual_i32, data)
                 }
             } else {
-                // For OUT, `actual` is bytes the device accepted (may be
-                // short). USB/IP encodes this in RET_SUBMIT.actual_length
-                // so the client can detect short writes.
                 let actual_i32 = i32::try_from(actual).unwrap_or(i32::MAX);
                 (0, actual_i32, Vec::new())
             }
@@ -305,6 +422,7 @@ async fn handle_submit(
     };
     let mut out = Vec::with_capacity(URB_HEADER_SIZE + payload.len());
     write_ret_submit(&mut out, seqnum, &ret, &payload);
-    stream.write_all(&out).await?;
-    Ok(())
+    if let Err(e) = writer.lock().await.write_all(&out).await {
+        debug!(seqnum, error = %e, "client write failed; closing");
+    }
 }
