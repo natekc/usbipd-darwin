@@ -521,7 +521,14 @@ async fn send_import_err(writer: &SharedWriter) -> Result<()> {
     Ok(())
 }
 
-#[allow(clippy::too_many_lines)]
+/// Top-level URB session loop.
+///
+/// After [`handle_import`] has written the import reply, the connection
+/// switches to URB mode permanently. This loop reads 48-byte URB headers
+/// and dispatches each one to the appropriate helper. The helpers are
+/// split out (rather than inlined) only to keep this function readable
+/// — the dispatch table here is the contract a reader needs to
+/// understand the protocol.
 async fn urb_loop(
     mut reader: BoxRead,
     writer: SharedWriter,
@@ -560,93 +567,25 @@ async fn urb_loop(
 
         match basic.command {
             USBIP_CMD_SUBMIT => {
-                let cmd = match CmdSubmit::decode(&header_buf[UrbHeader::SIZE..URB_HEADER_SIZE]) {
-                    Ok(c) => c,
-                    Err(e) => break Err(anyhow::Error::from(e).context("decode CMD_SUBMIT")),
-                };
-                // For OUT transfers the client sends the payload right after
-                // the header — must consume it serially before spawning the
-                // transfer task (we have only one reader).
-                let dir_in = basic.direction == USBIP_DIR_IN;
-                let tbl = usize::try_from(cmd.transfer_buffer_length).unwrap_or(0);
-                let mut out_payload = Vec::new();
-                if !dir_in && tbl > 0 {
-                    out_payload.resize(tbl, 0);
-                    if let Err(e) = reader.read_exact(&mut out_payload).await {
-                        break Err(anyhow::Error::from(e).context("read OUT payload"));
-                    }
+                if let Err(e) = handle_cmd_submit(
+                    &mut reader,
+                    &writer,
+                    &opened,
+                    &inflight,
+                    &permits,
+                    basic,
+                    &header_buf,
+                )
+                .await
+                {
+                    break Err(e);
                 }
-
-                let ep_addr = if basic.ep == 0 {
-                    0
-                } else {
-                    u8::try_from(basic.ep & 0xF).unwrap_or(0)
-                        | if dir_in { 0x80 } else { 0x00 }
-                };
-                let cancelled = Arc::new(AtomicBool::new(false));
-                // Acquire a permit before spawning so a flooding client
-                // back-pressures the read loop.
-                let Ok(permit) = Arc::clone(&permits).acquire_owned().await else {
-                    break Err(anyhow!("semaphore closed"));
-                };
-                let opened2 = Arc::clone(&opened);
-                let writer2 = Arc::clone(&writer);
-                let inflight2 = Arc::clone(&inflight);
-                let cancelled2 = Arc::clone(&cancelled);
-                let seqnum = basic.seqnum;
-                let handle = tokio::spawn(async move {
-                    let _permit = permit;
-                    run_submit(opened2, writer2, basic, cmd, out_payload, cancelled2).await;
-                    inflight2
-                        .lock()
-                        .expect("inflight map poisoned")
-                        .remove(&seqnum);
-                });
-                inflight
-                    .lock()
-                    .expect("inflight map poisoned")
-                    .insert(seqnum, Inflight {
-                        abort: handle.abort_handle(),
-                        ep_addr,
-                        cancelled,
-                    });
             }
             USBIP_CMD_UNLINK => {
-                let unlink = match CmdUnlink::decode(
-                    &header_buf[UrbHeader::SIZE..URB_HEADER_SIZE],
-                ) {
-                    Ok(u) => u,
-                    Err(e) => break Err(anyhow::Error::from(e).context("decode CMD_UNLINK")),
-                };
-                // Look up the target SUBMIT, mark it cancelled, force its
-                // in-flight nusb call to return early via cancel_endpoint,
-                // and abort the task so it never writes a RET_SUBMIT.
-                let status = {
-                    let mut map = inflight.lock().expect("inflight map poisoned");
-                    if let Some(info) = map.remove(&unlink.unlink_seqnum) {
-                        info.cancelled.store(true, Ordering::SeqCst);
-                        if info.ep_addr != 0 {
-                            opened.cancel_endpoint(info.ep_addr);
-                        }
-                        info.abort.abort();
-                        0
-                    } else {
-                        // The URB has already completed (or never existed).
-                        // Linux returns -ENOENT but most clients ignore the
-                        // status; stay quiet and report success.
-                        0
-                    }
-                };
-                debug!(
-                    %peer,
-                    seqnum = basic.seqnum,
-                    unlink_seqnum = unlink.unlink_seqnum,
-                    "CMD_UNLINK"
-                );
-                let mut out = Vec::with_capacity(URB_HEADER_SIZE);
-                write_ret_unlink(&mut out, basic.seqnum, status);
-                if let Err(e) = writer.lock().await.write_all(&out).await {
-                    break Err(anyhow::Error::from(e).context("write RET_UNLINK"));
+                if let Err(e) =
+                    handle_cmd_unlink(&writer, &opened, &inflight, &peer, basic, &header_buf).await
+                {
+                    break Err(e);
                 }
             }
             other => {
@@ -657,9 +596,123 @@ async fn urb_loop(
         }
     };
 
-    // Drain in-flight tasks on disconnect so they don't keep firing into
-    // a dead socket. Aborting is fire-and-forget; tasks observe the
-    // cancelled flag and skip writing.
+    drain_inflight(&inflight);
+    result
+}
+
+/// Handle a single `CMD_SUBMIT` URB header.
+///
+/// 1. Decode the 40-byte `CmdSubmit` trailer.
+/// 2. For OUT transfers, read the payload off `reader` synchronously
+///    (we have a single read half, so payload reads must be serialised).
+/// 3. Acquire a permit so a flooding client back-pressures the read loop.
+/// 4. Spawn a task to actually issue the transfer; record it in
+///    `inflight` keyed by seqnum so a later `CMD_UNLINK` can cancel it.
+async fn handle_cmd_submit(
+    reader: &mut BoxRead,
+    writer: &SharedWriter,
+    opened: &Arc<OpenedDevice>,
+    inflight: &Arc<std::sync::Mutex<HashMap<u32, Inflight>>>,
+    permits: &Arc<Semaphore>,
+    basic: UrbHeader,
+    header_buf: &[u8; URB_HEADER_SIZE],
+) -> Result<()> {
+    let cmd = CmdSubmit::decode(&header_buf[UrbHeader::SIZE..URB_HEADER_SIZE])
+        .context("decode CMD_SUBMIT")?;
+    let dir_in = basic.direction == USBIP_DIR_IN;
+    let tbl = usize::try_from(cmd.transfer_buffer_length).unwrap_or(0);
+    let mut out_payload = Vec::new();
+    if !dir_in && tbl > 0 {
+        out_payload.resize(tbl, 0);
+        reader
+            .read_exact(&mut out_payload)
+            .await
+            .context("read OUT payload")?;
+    }
+
+    let ep_addr = if basic.ep == 0 {
+        0
+    } else {
+        u8::try_from(basic.ep & 0xF).unwrap_or(0) | if dir_in { 0x80 } else { 0x00 }
+    };
+    let cancelled = Arc::new(AtomicBool::new(false));
+    let permit = Arc::clone(permits)
+        .acquire_owned()
+        .await
+        .map_err(|_| anyhow!("semaphore closed"))?;
+    let opened2 = Arc::clone(opened);
+    let writer2 = Arc::clone(writer);
+    let inflight2 = Arc::clone(inflight);
+    let cancelled2 = Arc::clone(&cancelled);
+    let seqnum = basic.seqnum;
+    let handle = tokio::spawn(async move {
+        let _permit = permit;
+        run_submit(opened2, writer2, basic, cmd, out_payload, cancelled2).await;
+        inflight2
+            .lock()
+            .expect("inflight map poisoned")
+            .remove(&seqnum);
+    });
+    inflight
+        .lock()
+        .expect("inflight map poisoned")
+        .insert(seqnum, Inflight {
+            abort: handle.abort_handle(),
+            ep_addr,
+            cancelled,
+        });
+    Ok(())
+}
+
+/// Handle a single `CMD_UNLINK` URB header.
+///
+/// Look up the in-flight `CMD_SUBMIT` by `unlink_seqnum`, flag it
+/// cancelled, ask nusb to cancel the endpoint so any blocked transfer
+/// returns immediately, abort the spawned task so it never writes a
+/// stale `RET_SUBMIT`, then send `RET_UNLINK`. If the SUBMIT has
+/// already completed we silently report success — most Linux clients
+/// ignore the status anyway.
+async fn handle_cmd_unlink(
+    writer: &SharedWriter,
+    opened: &Arc<OpenedDevice>,
+    inflight: &Arc<std::sync::Mutex<HashMap<u32, Inflight>>>,
+    peer: &Peer,
+    basic: UrbHeader,
+    header_buf: &[u8; URB_HEADER_SIZE],
+) -> Result<()> {
+    let unlink = CmdUnlink::decode(&header_buf[UrbHeader::SIZE..URB_HEADER_SIZE])
+        .context("decode CMD_UNLINK")?;
+    {
+        let mut map = inflight.lock().expect("inflight map poisoned");
+        if let Some(info) = map.remove(&unlink.unlink_seqnum) {
+            info.cancelled.store(true, Ordering::SeqCst);
+            if info.ep_addr != 0 {
+                opened.cancel_endpoint(info.ep_addr);
+            }
+            info.abort.abort();
+        }
+    }
+    debug!(
+        %peer,
+        seqnum = basic.seqnum,
+        unlink_seqnum = unlink.unlink_seqnum,
+        "CMD_UNLINK"
+    );
+    let mut out = Vec::with_capacity(URB_HEADER_SIZE);
+    write_ret_unlink(&mut out, basic.seqnum, 0);
+    writer
+        .lock()
+        .await
+        .write_all(&out)
+        .await
+        .context("write RET_UNLINK")?;
+    Ok(())
+}
+
+/// Drain in-flight tasks on disconnect so they don't keep firing into
+/// a dead socket. Aborting is fire-and-forget; tasks observe the
+/// cancelled flag and skip writing.
+fn drain_inflight(inflight: &Arc<std::sync::Mutex<HashMap<u32, Inflight>>>) {
     let pending: Vec<Inflight> = inflight
         .lock()
         .expect("inflight map poisoned")
@@ -670,7 +723,6 @@ async fn urb_loop(
         info.cancelled.store(true, Ordering::SeqCst);
         info.abort.abort();
     }
-    result
 }
 
 struct Inflight {
