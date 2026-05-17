@@ -10,9 +10,16 @@
 
 pub mod error;
 pub mod op;
+pub mod urb;
 
 pub use error::ProtoError;
 pub use op::{
     ExportedDevice, ExportedInterface, OP_REP_DEVLIST, OP_REP_IMPORT, OP_REQ_DEVLIST,
-    OP_REQ_IMPORT, OpHeader, USBIP_VERSION,
+    OP_REQ_IMPORT, OpHeader, USBIP_VERSION, decode_req_import_busid, encode_rep_import_err,
+    encode_rep_import_ok,
+};
+pub use urb::{
+    CmdSubmit, CmdUnlink, RetSubmit, RetUnlink, URB_HEADER_SIZE, USBIP_CMD_SUBMIT,
+    USBIP_CMD_UNLINK, USBIP_DIR_IN, USBIP_DIR_OUT, USBIP_RET_SUBMIT, USBIP_RET_UNLINK, UrbHeader,
+    write_ret_submit, write_ret_unlink,
 };

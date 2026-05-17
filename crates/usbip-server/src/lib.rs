@@ -20,8 +20,9 @@ pub enum Reply {
     Unsupported(u16),
 }
 
-/// Handle a single inbound op-message header (plus any payload, not yet
-/// applicable to `OP_REQ_DEVLIST`) and produce a reply.
+/// Handle a single inbound op-message header (devlist only). For
+/// `OP_REQ_IMPORT` the daemon drives the protocol itself because it must
+/// transition the connection into URB mode.
 pub fn handle_op(header: OpHeader, devices: &[UsbDevice]) -> Result<Reply, ProtoError> {
     match header.code {
         OP_REQ_DEVLIST => Ok(Reply::Bytes(encode_rep_devlist(devices))),
@@ -31,7 +32,8 @@ pub fn handle_op(header: OpHeader, devices: &[UsbDevice]) -> Result<Reply, Proto
 
 /// Encode an `OP_REP_DEVLIST` payload: op-header + u32 device count +
 /// one [`ExportedDevice`] record per device.
-fn encode_rep_devlist(devices: &[UsbDevice]) -> Vec<u8> {
+#[must_use]
+pub fn encode_rep_devlist(devices: &[UsbDevice]) -> Vec<u8> {
     let mut out = Vec::with_capacity(8 + 4 + devices.len() * 320);
     OpHeader::new(OP_REP_DEVLIST).encode(&mut out);
     let n = u32::try_from(devices.len()).unwrap_or(u32::MAX);
@@ -42,7 +44,10 @@ fn encode_rep_devlist(devices: &[UsbDevice]) -> Vec<u8> {
     out
 }
 
-fn to_exported(d: &UsbDevice) -> ExportedDevice {
+/// Convert a [`UsbDevice`] (host model) into an [`ExportedDevice`] (wire
+/// model). The path field is synthesized as `/usbipd-mac/<busid>`.
+#[must_use]
+pub fn to_exported(d: &UsbDevice) -> ExportedDevice {
     ExportedDevice {
         path: format!("/usbipd-mac/{}", d.busid),
         busid: d.busid.clone(),
@@ -107,13 +112,10 @@ mod tests {
             Reply::Bytes(b) => b,
             Reply::Unsupported(_) => panic!("expected bytes"),
         };
-        // op header
-        assert_eq!(&bytes[0..2], &[0x01, 0x11]); // version
-        assert_eq!(&bytes[2..4], &[0x00, 0x05]); // OP_REP_DEVLIST
-        assert_eq!(&bytes[4..8], &[0, 0, 0, 0]); // status
-        // device count
+        assert_eq!(&bytes[0..2], &[0x01, 0x11]);
+        assert_eq!(&bytes[2..4], &[0x00, 0x05]);
+        assert_eq!(&bytes[4..8], &[0, 0, 0, 0]);
         assert_eq!(&bytes[8..12], &[0, 0, 0, 1]);
-        // exported device record decodes back round-trip
         let (dev, _) = usbip_proto::ExportedDevice::decode(&bytes[12..]).unwrap();
         assert_eq!(dev.id_vendor, 0x0781);
         assert_eq!(dev.id_product, 0x5530);
@@ -137,13 +139,8 @@ mod tests {
 
     #[test]
     fn empty_devlist_encodes_zero_count() {
-        let header = OpHeader::new(OP_REQ_DEVLIST);
-        let reply = handle_op(header, &[]).unwrap();
-        let bytes = match reply {
-            Reply::Bytes(b) => b,
-            Reply::Unsupported(_) => panic!("expected bytes"),
-        };
-        assert_eq!(bytes.len(), 12); // 8 header + 4 count
+        let bytes = encode_rep_devlist(&[]);
+        assert_eq!(bytes.len(), 12);
         assert_eq!(&bytes[8..12], &[0, 0, 0, 0]);
     }
 }

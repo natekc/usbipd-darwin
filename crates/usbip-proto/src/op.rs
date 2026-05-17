@@ -143,6 +143,25 @@ impl ExportedDevice {
         }
     }
 
+    /// Encode just the fixed 312-byte device header (no interfaces).
+    /// Used by `OP_REP_IMPORT`, which omits interface descriptors.
+    pub fn encode_header_only(&self, out: &mut Vec<u8>) {
+        write_fixed_str(out, &self.path, 256);
+        write_fixed_str(out, &self.busid, 32);
+        out.extend_from_slice(&self.busnum.to_be_bytes());
+        out.extend_from_slice(&self.devnum.to_be_bytes());
+        out.extend_from_slice(&self.speed.to_be_bytes());
+        out.extend_from_slice(&self.id_vendor.to_be_bytes());
+        out.extend_from_slice(&self.id_product.to_be_bytes());
+        out.extend_from_slice(&self.bcd_device.to_be_bytes());
+        out.push(self.b_device_class);
+        out.push(self.b_device_subclass);
+        out.push(self.b_device_protocol);
+        out.push(self.b_configuration_value);
+        out.push(self.b_num_configurations);
+        out.push(u8::try_from(self.interfaces.len()).unwrap_or(u8::MAX));
+    }
+
     pub fn decode(buf: &[u8]) -> Result<(Self, usize), ProtoError> {
         if buf.len() < Self::HEADER_SIZE {
             return Err(ProtoError::ShortRead {
@@ -207,6 +226,36 @@ fn write_fixed_str(out: &mut Vec<u8>, s: &str, width: usize) {
     let take = bytes.len().min(width);
     out.extend_from_slice(&bytes[..take]);
     out.extend(std::iter::repeat_n(0u8, width - take));
+}
+
+/// Decode an `OP_REQ_IMPORT` body (after the 8-byte op header): a 32-byte
+/// NUL-padded busid.
+pub fn decode_req_import_busid(buf: &[u8]) -> Result<String, ProtoError> {
+    if buf.len() < 32 {
+        return Err(ProtoError::ShortRead {
+            need: 32,
+            got: buf.len(),
+        });
+    }
+    Ok(read_fixed_str(&buf[0..32]))
+}
+
+/// Encode an `OP_REP_IMPORT` reply (success): op header + 312-byte device
+/// header (no interface descriptors).
+pub fn encode_rep_import_ok(out: &mut Vec<u8>, dev: &ExportedDevice) {
+    OpHeader::new(OP_REP_IMPORT).encode(out);
+    dev.encode_header_only(out);
+}
+
+/// Encode an `OP_REP_IMPORT` failure reply: op header with non-zero status,
+/// no device payload.
+pub fn encode_rep_import_err(out: &mut Vec<u8>) {
+    let h = OpHeader {
+        version: USBIP_VERSION,
+        code: OP_REP_IMPORT,
+        status: 1,
+    };
+    h.encode(out);
 }
 
 fn read_fixed_str(buf: &[u8]) -> String {
