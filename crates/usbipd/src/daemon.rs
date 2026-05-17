@@ -541,15 +541,31 @@ async fn urb_loop(
         Arc::new(std::sync::Mutex::new(HashMap::new()));
     let permits = Arc::new(Semaphore::new(MAX_INFLIGHT_URBS));
 
+    // Hotplug watchdog: poll for the device every few seconds. If it
+    // disappears we want to close the session promptly rather than wait
+    // for the client to notice via the next transfer error (which may
+    // never come for an idle attached device, e.g. a keyboard).
+    let unplug_notify = Arc::new(tokio::sync::Notify::new());
+    let _watchdog = HotplugWatchdog::spawn(desc.busid.clone(), Arc::clone(&unplug_notify));
+
     let mut header_buf = [0u8; URB_HEADER_SIZE];
     let result: Result<()> = loop {
         // EOF here means clean client disconnect.
-        if let Err(e) = reader.read_exact(&mut header_buf).await {
-            if e.kind() == std::io::ErrorKind::UnexpectedEof {
-                debug!(%peer, "client disconnected");
+        let read_fut = reader.read_exact(&mut header_buf);
+        let unplug_fut = unplug_notify.notified();
+        tokio::pin!(read_fut, unplug_fut);
+        tokio::select! {
+            r = &mut read_fut => if let Err(e) = r {
+                if e.kind() == std::io::ErrorKind::UnexpectedEof {
+                    debug!(%peer, "client disconnected");
+                    break Ok(());
+                }
+                break Err(anyhow::Error::from(e).context("read URB header"));
+            },
+            () = &mut unplug_fut => {
+                warn!(%peer, busid = %desc.busid, "device unplugged; closing session");
                 break Ok(());
             }
-            break Err(anyhow::Error::from(e).context("read URB header"));
         }
         let basic = match UrbHeader::decode(&header_buf[0..UrbHeader::SIZE]) {
             Ok(b) => b,
@@ -729,6 +745,54 @@ struct Inflight {
     abort: AbortHandle,
     ep_addr: u8,
     cancelled: Arc<AtomicBool>,
+}
+
+/// Periodic poller that fires a `Notify` when an imported busid
+/// disappears from `host_mac::list_devices()` (i.e. physical unplug
+/// or `kextload` re-attach by macOS).
+///
+/// Polling cadence is intentionally coarse (every `POLL_INTERVAL`):
+/// the URB read path already surfaces I/O errors on the device
+/// immediately, so this is just a backstop for the idle-attached case
+/// (HID keyboards, paused mass storage, etc.).
+struct HotplugWatchdog {
+    task: tokio::task::JoinHandle<()>,
+}
+
+impl HotplugWatchdog {
+    const POLL_INTERVAL: Duration = Duration::from_secs(3);
+
+    fn spawn(busid: String, notify: Arc<tokio::sync::Notify>) -> Self {
+        let task = tokio::spawn(async move {
+            let mut tick = tokio::time::interval(Self::POLL_INTERVAL);
+            tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            // Skip the immediate first tick — we just verified the
+            // device exists by opening it.
+            tick.tick().await;
+            loop {
+                tick.tick().await;
+                let busid = busid.clone();
+                let present = tokio::task::spawn_blocking(move || {
+                    host_mac::list_devices()
+                        .map(|ds| ds.iter().any(|d| d.busid == busid))
+                        .unwrap_or(true) // on enumeration failure, assume present
+                })
+                .await
+                .unwrap_or(true);
+                if !present {
+                    notify.notify_waiters();
+                    return;
+                }
+            }
+        });
+        Self { task }
+    }
+}
+
+impl Drop for HotplugWatchdog {
+    fn drop(&mut self) {
+        self.task.abort();
+    }
 }
 
 async fn run_submit(
