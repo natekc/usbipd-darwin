@@ -41,6 +41,11 @@ const URB_TIMEOUT: Duration = Duration::from_secs(60);
 const MAX_INFLIGHT_URBS: usize = 256;
 
 /// Linux errno values used in `RET_SUBMIT.status` on failure.
+///
+/// These are the values the *client* (always a Linux kernel usbip-vhci
+/// driver) expects, so we hard-code them as Linux-x86 ABI numbers
+/// regardless of the host we're compiled on. They are NOT the host's
+/// errno; do not replace with `libc::EPIPE` etc.
 const EPIPE: i32 = -32;
 const EOVERFLOW: i32 = -75;
 
