@@ -203,12 +203,28 @@ async fn serve(config: DaemonConfig) -> Result<()> {
     }
     let state = Arc::new(DaemonState::new(config.policy.clone()));
 
-    let shutdown = tokio::signal::ctrl_c();
+    // Listen for both Ctrl-C (interactive) and SIGTERM (launchd, systemd,
+    // `kill <pid>`). Either signal triggers a graceful shutdown: stop
+    // accepting new connections, then release every device we still
+    // hold captured back to the kernel. Without the explicit release
+    // step a captured device stays in capture mode across daemon
+    // restarts (the flag is sticky until either a release re-enumerate
+    // or a physical unplug), which is great for crash recovery but a
+    // user-visible regression after a clean stop — the device's normal
+    // kernel driver wouldn't reattach until the user replugs it.
+    let shutdown = async {
+        let mut term = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+            .expect("install SIGTERM handler");
+        tokio::select! {
+            r = tokio::signal::ctrl_c() => r,
+            _ = term.recv() => Ok(()),
+        }
+    };
     tokio::pin!(shutdown);
 
     info!(endpoint = %config.endpoint, "usbipd listening");
 
-    match &config.endpoint {
+    let accept_result = match &config.endpoint {
         Endpoint::Tcp(addr) => {
             let listener = TcpListener::bind(addr)
                 .await
@@ -239,7 +255,26 @@ async fn serve(config: DaemonConfig) -> Result<()> {
             }
             accept_loop_unix(listener, path.clone(), &state, &mut shutdown).await
         }
+    };
+
+    // Best-effort release of every device still marked attached.
+    // AttachGuard::drop is what normally releases an individual device,
+    // but on a clean shutdown we may exit before in-flight sessions get
+    // a chance to drop their guards — release here too so a SIGTERM
+    // doesn't leave devices captured.
+    let busids: Vec<String> = {
+        let map = state.attached.lock().expect("attached map poisoned");
+        map.keys().cloned().collect()
+    };
+    for busid in busids {
+        if let Err(e) = host_mac::release_capture(&busid) {
+            warn!(busid = %busid, error = %e, "release_capture on shutdown failed");
+        } else {
+            info!(busid = %busid, "released captured device on shutdown");
+        }
     }
+
+    accept_result
 }
 
 async fn accept_loop_tcp(
