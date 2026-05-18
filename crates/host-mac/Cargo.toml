@@ -20,18 +20,9 @@ libc                = "0.2"
 
 [dev-dependencies]
 ctrlc = "3"
-tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
 [[example]]
 name = "hid_keyboard"
-required-features = []
-
-[[example]]
-name = "bulk_test"
-required-features = []
-
-[[example]]
-name = "bulk_test_capture"
 required-features = []
 
 [lints]
