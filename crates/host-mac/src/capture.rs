@@ -58,10 +58,10 @@ type ULONG = ::std::os::raw::c_ulong;
 /// `USBDeviceReEnumerate` option that causes the device to come back
 /// with all kernel drivers detached. Defined in
 /// `<IOKit/usb/IOUSBLib.h>` as `kUSBReEnumerateCaptureDeviceMask`.
-const kUSBReEnumerateCaptureDeviceMask: UInt32 = 1 << 30;
+pub(crate) const kUSBReEnumerateCaptureDeviceMask: UInt32 = 1 << 30;
 /// `USBDeviceReEnumerate` option that requests a release of the
 /// capture (kernel drivers may rebind on next re-enumeration).
-const kUSBReEnumerateReleaseDeviceMask: UInt32 = 1 << 29;
+pub(crate) const kUSBReEnumerateReleaseDeviceMask: UInt32 = 1 << 29;
 
 // ---------------------------------------------------------------------------
 // Bare-minimum vtable: we only call Release, USBDeviceOpenSeize,
@@ -427,4 +427,57 @@ fn reenumerate_with_options(registry_entry_id: u64, options: UInt32) -> Result<(
 #[allow(dead_code)]
 fn _cf_release_keepalive(r: *const c_void) {
     unsafe { CFRelease(r) }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // Pin Apple's `<IOKit/usb/IOUSBLib.h>` constants so that anyone hand-
+    // editing the bit positions notices immediately. Drift here would
+    // silently swap the meaning of capture/release, with no IOKit error.
+    #[test]
+    fn capture_mask_matches_apple_header() {
+        assert_eq!(kUSBReEnumerateCaptureDeviceMask, 0x4000_0000);
+    }
+
+    #[test]
+    fn release_mask_matches_apple_header() {
+        assert_eq!(kUSBReEnumerateReleaseDeviceMask, 0x2000_0000);
+    }
+
+    #[test]
+    fn capture_and_release_masks_are_disjoint() {
+        assert_eq!(
+            kUSBReEnumerateCaptureDeviceMask & kUSBReEnumerateReleaseDeviceMask,
+            0,
+            "capture and release flags must not overlap"
+        );
+    }
+
+    #[test]
+    fn no_service_error_includes_hex_registry_id() {
+        let err = CaptureError::NoService(0xdead_beef);
+        let s = format!("{err}");
+        assert!(s.contains("0xdeadbeef"), "got: {s}");
+    }
+
+    #[test]
+    fn open_seize_error_mentions_root() {
+        #[allow(clippy::cast_possible_wrap)]
+        let err = CaptureError::OpenSeize(0xe000_02c5_u32 as i32);
+        let s = format!("{err}");
+        assert!(
+            s.contains("root"),
+            "OpenSeize message should hint that root is required; got: {s}"
+        );
+    }
+
+    // Tests don't run as root, so this should be false. If someone runs
+    // `cargo test` under sudo, we don't want to fail — just confirm the
+    // type is a bool.
+    #[test]
+    fn is_root_returns_bool() {
+        let _: bool = is_root();
+    }
 }
