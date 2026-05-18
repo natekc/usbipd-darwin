@@ -16,6 +16,28 @@ This project takes a different bet:
 
 We deliberately give up the DriverKit promotion path: a pure-Rust codebase cannot ship a dext bundle. If Apple ever grants the necessary entitlement to small projects, we would add a Swift sidecar that XPCs to this daemon rather than rewriting in Swift.
 
+### Why not just run a Linux VM as the USB/IP server?
+
+A common workaround is to spin up a small Linux VM, pass USB devices into it via the VMM (QEMU `-device usb-host`, VirtualBox, …), and run the stock Linux `usbipd` inside that VM. That works, but only if you control the VMM the device should ultimately end up in:
+
+- It doesn't help when the *consumer* is itself a Linux VM that already needs the device on a different VMM (Lima's Vz/QEMU/krunkit/WSL2 drivers each have their own USB story or none at all).
+- The intermediate VM has to be running before any device can be claimed, and each device round-trips through two virtualization boundaries.
+- macOS's IOKit still owns the device on the host; the intermediate VM only sees what the host VMM chose to expose, which on Apple Silicon is "very little" for most VMMs.
+
+What we actually need is for **macOS itself** to act as the USB/IP server, so any USB/IP client — Lima guest, bare-metal Linux box on the LAN, another macOS host via a Linux VM — can attach to it directly.
+
+### Why not `usbipd-win`?
+
+[`usbipd-win`](https://github.com/dorssel/usbipd-win) is the canonical reference for "host-side USB/IP daemon on a non-Linux OS". It only runs on Windows: it relies on the Windows `VBoxUSB` filter driver to detach a device from its kernel-mode driver before re-exporting it. macOS has no equivalent kernel-mode hook available to unprivileged code. This project is the macOS-shaped analogue: same wire protocol, same UX, different OS-specific capture mechanism.
+
+### Why force-capture via `USBDeviceReEnumerate`?
+
+On macOS, opening a device that a kernel driver (`IOHIDFamily`, `IOUSBMassStorageClass`, `IOUSBHIDDriver`, …) has already matched returns `kIOReturnExclusiveAccess` (`0xe00002c5`). Linux's `usbip` solves this with `usbip bind`, which detaches the kernel driver via sysfs. macOS has no analogous user-facing knob.
+
+The only documented mechanism to break a kernel driver's claim from user space is [`IOUSBDeviceInterface500::USBDeviceReEnumerate`](https://developer.apple.com/documentation/iokit/iousbdeviceinterface500/1413977-usbdevicereenumerate) with the `kUSBReEnumerateCaptureDeviceMask` flag, which requires running as root. The device is unloaded from its kernel driver, re-enumerated, and re-presented to user space — at which point `nusb` can open and drive it.
+
+This is why the daemon ships with a sudoers.d snippet rather than a launchd plist as the default install path: the security model is "narrow sudo rule for the daemon binary", not "run as root forever".
+
 ## Layout
 
 ```
