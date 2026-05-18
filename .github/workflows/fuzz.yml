@@ -1,0 +1,57 @@
+name: fuzz-smoke
+
+# Runs each cargo-fuzz target for a brief wall-clock budget on every
+# push/PR. The goal is regression detection, not coverage — full fuzz
+# runs are expected to happen offline or via a future OSS-Fuzz
+# integration. Failing inputs that surface here should be triaged,
+# added to the corpus under `crates/usbip-proto/fuzz/corpus/<target>/`,
+# and have a regression unit test backported to `usbip-proto` if
+# practical.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    paths:
+      - 'crates/usbip-proto/**'
+      - '.github/workflows/fuzz.yml'
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  smoke:
+    name: fuzz ${{ matrix.target }} (60s)
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        target: [op_header, cmd_submit, urb_header, req_import_busid]
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@nightly
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: |
+            .
+            crates/usbip-proto/fuzz
+      - name: Install cargo-fuzz
+        run: cargo install --locked cargo-fuzz
+      - name: Smoke ${{ matrix.target }}
+        working-directory: crates/usbip-proto/fuzz
+        # -max_total_time=60: cap each target at 60 wall-seconds.
+        # -runs=...: extra cap to prevent runaway CPU in case the
+        # libFuzzer wall-clock check misbehaves.
+        run: |
+          cargo +nightly fuzz run ${{ matrix.target }} -- \
+            -max_total_time=60 \
+            -runs=10000000
+      - name: Upload crash artifacts (if any)
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: fuzz-crash-${{ matrix.target }}
+          path: |
+            crates/usbip-proto/fuzz/artifacts/${{ matrix.target }}/
+            crates/usbip-proto/fuzz/corpus/${{ matrix.target }}/
+          if-no-files-found: ignore
