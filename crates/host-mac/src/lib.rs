@@ -527,8 +527,7 @@ impl OpenedDevice {
         let dev = self.device();
         let active_cfg = dev
             .active_configuration()
-            .map(|c| c.configuration_value())
-            .unwrap_or(0);
+            .map_or(0, |c| c.configuration_value());
         let num_cfg = u8::try_from(dev.configurations().count()).unwrap_or(1);
 
         // Interfaces from the *active* configuration, alt 0 of each.
