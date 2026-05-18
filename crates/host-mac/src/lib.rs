@@ -597,20 +597,27 @@ impl OpenedDevice {
             let cfg = (setup.w_value & 0xFF) as u8;
             debug!(busid = %self.busid, cfg, "intercepting SET_CONFIGURATION");
             // Invalidate caches: interfaces and endpoints belong to the
-            // *previous* configuration.
-            self.interfaces
-                .lock()
-                .expect("interface cache poisoned")
-                .clear();
+            // *previous* configuration. Drop endpoints FIRST so they
+            // release their Arc<Interface> refs; then drop interfaces.
             self.endpoints
                 .write()
                 .expect("endpoint cache poisoned")
+                .clear();
+            self.interfaces
+                .lock()
+                .expect("interface cache poisoned")
                 .clear();
             self.alt_settings
                 .lock()
                 .expect("alt-setting map poisoned")
                 .clear();
+            // Always call through to nusb. After USBDeviceReEnumerate(Capture)
+            // the device is in an unconfigured state regardless of what
+            // nusb's cached `active_configuration_value()` reports, so
+            // an explicit `set_configuration` is required to make any
+            // interface claim functional.
             self.device().set_configuration(cfg).wait()?;
+            debug!(busid = %self.busid, cfg, "SET_CONFIGURATION completed");
             return Ok(Vec::new());
         }
         // SET_INTERFACE: bmRequestType=0x01, bRequest=0x0B, wValue=alt, wIndex=iface
@@ -676,31 +683,60 @@ impl OpenedDevice {
         timeout: Duration,
     ) -> Result<TransferResult, HostError> {
         let kind = self.endpoint_kind(ep_addr)?;
+        debug!(busid = %self.busid, ep_addr = format!("0x{:02x}", ep_addr), iface = kind.0, "data_transfer: ensuring endpoint");
         let ep = self.ensure_endpoint(ep_addr, kind)?;
+        debug!(busid = %self.busid, ep_addr = format!("0x{:02x}", ep_addr), "data_transfer: endpoint ready");
         // Lock ONLY this endpoint's mutex across the blocking transfer.
         // Concurrent transfers on other endpoints proceed in parallel.
         let mut ep_guard = ep.lock().expect("endpoint mutex poisoned");
         let dir_in = ep_addr & 0x80 != 0;
+        // nusb requires IN bulk/interrupt reads to be a non-zero multiple
+        // of the endpoint's `wMaxPacketSize`. USB/IP imposes no such
+        // constraint, so pad the request up and truncate the response.
+        let mps = match &*ep_guard {
+            AnyEp::BulkIn(e) => e.max_packet_size(),
+            AnyEp::BulkOut(e) => e.max_packet_size(),
+            AnyEp::InterruptIn(e) => e.max_packet_size(),
+            AnyEp::InterruptOut(e) => e.max_packet_size(),
+        };
+        let padded_len = if dir_in && mps > 0 {
+            length.div_ceil(mps).max(1) * mps
+        } else {
+            length
+        };
         let buf = if dir_in {
-            nusb::transfer::Buffer::new(length)
+            nusb::transfer::Buffer::new(padded_len)
         } else {
             let mut b = nusb::transfer::Buffer::new(out_data.len());
             b.extend_from_slice(out_data);
             b
         };
         let completion = match &mut *ep_guard {
-            AnyEp::BulkIn(e) => e.transfer_blocking(buf, timeout),
-            AnyEp::BulkOut(e) => e.transfer_blocking(buf, timeout),
+            AnyEp::BulkIn(e) => {
+                debug!(busid = %self.busid, ep_addr = format!("0x{:02x}", ep_addr), len = padded_len, "bulk-in transfer_blocking start");
+                e.transfer_blocking(buf, timeout)
+            }
+            AnyEp::BulkOut(e) => {
+                debug!(busid = %self.busid, ep_addr = format!("0x{:02x}", ep_addr), len = out_data.len(), "bulk-out transfer_blocking start");
+                e.transfer_blocking(buf, timeout)
+            }
             AnyEp::InterruptIn(e) => e.transfer_blocking(buf, timeout),
             AnyEp::InterruptOut(e) => e.transfer_blocking(buf, timeout),
         };
+        debug!(busid = %self.busid, ep_addr = format!("0x{:02x}", ep_addr), "transfer_blocking returned");
         // Pull actual_length BEFORE consuming the buffer via into_result.
         let actual_length = completion.actual_len;
         let data = completion.into_result()?;
         if dir_in {
+            // Truncate to caller-requested length (and to actual bytes
+            // received) — the padding was an IOKit transport requirement,
+            // not data the USB/IP client asked for.
+            let usable = actual_length.min(length);
+            let mut v = data.into_vec();
+            v.truncate(usable);
             Ok(TransferResult {
-                actual_length,
-                data: data.into_vec(),
+                actual_length: usable,
+                data: v,
             })
         } else {
             Ok(TransferResult {
@@ -802,7 +838,7 @@ impl OpenedDevice {
         }
         let (iface_num, kind) = k;
         let iface = self.ensure_interface(iface_num)?;
-        let any = match (kind, ep_addr & 0x80 != 0) {
+        let mut any = match (kind, ep_addr & 0x80 != 0) {
             (EpKind::Bulk, true) => AnyEp::BulkIn(iface.endpoint::<Bulk, In>(ep_addr)?),
             (EpKind::Bulk, false) => AnyEp::BulkOut(iface.endpoint::<Bulk, Out>(ep_addr)?),
             (EpKind::Interrupt, true) => {
@@ -812,6 +848,20 @@ impl OpenedDevice {
                 AnyEp::InterruptOut(iface.endpoint::<Interrupt, Out>(ep_addr)?)
             }
         };
+        // After capture+reenumerate the pipe may inherit a stale stall
+        // state from whatever the kernel driver last did. Always issue
+        // `clear_halt` before first use; it's idempotent and cheap.
+        let halt_res = match &mut any {
+            AnyEp::BulkIn(e) => e.clear_halt().wait(),
+            AnyEp::BulkOut(e) => e.clear_halt().wait(),
+            AnyEp::InterruptIn(e) => e.clear_halt().wait(),
+            AnyEp::InterruptOut(e) => e.clear_halt().wait(),
+        };
+        if let Err(e) = halt_res {
+            debug!(busid = %self.busid, ep_addr = format!("0x{ep_addr:02x}"), error = %e, "clear_halt failed (continuing)");
+        } else {
+            debug!(busid = %self.busid, ep_addr = format!("0x{ep_addr:02x}"), "clear_halt ok");
+        }
         let arc = Arc::new(Mutex::new(any));
         let mut endpoints = self.endpoints.write().expect("endpoint cache poisoned");
         let entry = endpoints
@@ -827,7 +877,22 @@ impl OpenedDevice {
                 return Ok(i.clone());
             }
         }
+        debug!(busid = %self.busid, iface = num, "claim_interface start");
         let iface = self.device().claim_interface(num).wait()?;
+        debug!(busid = %self.busid, iface = num, "claim_interface ok");
+        // macOS IOKit's `USBInterfaceOpen` only attaches the user-client;
+        // pipes are not opened until the interface is told which alt
+        // setting to use. nusb's `claim_interface` does NOT issue
+        // `SetAlternateInterface`, so on macOS the bulk/interrupt
+        // endpoints of the freshly-claimed interface return immediately
+        // from `transfer_blocking` with no-op completions (or hang) until
+        // we explicitly select alt 0. Other platforms tolerate this
+        // because their kernel auto-binds alt 0 at config time.
+        if let Err(e) = iface.set_alt_setting(0).wait() {
+            debug!(busid = %self.busid, iface = num, error = %e, "set_alt_setting(0) failed (continuing)");
+        } else {
+            debug!(busid = %self.busid, iface = num, "set_alt_setting(0) ok");
+        }
         let mut ifaces = self.interfaces.lock().expect("interface cache poisoned");
         Ok(ifaces.entry(num).or_insert(iface).clone())
     }
