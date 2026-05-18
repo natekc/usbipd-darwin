@@ -9,8 +9,15 @@
 //! {"event":"added","busid":"01-1","vendor_id":"1050","product_id":"0407",
 //!  "manufacturer":"Yubico","product":"YubiKey OTP+FIDO+CCID","serial":"123",
 //!  "class":0,"subclass":0,"protocol":0,"speed":2}
-//! {"event":"removed","busid":"01-1"}
+//! {"event":"removed","busid":"01-1","vendor_id":"1050","product_id":"0407"}
 //! ```
+//!
+//! Both event kinds carry `vendor_id` and `product_id` so consumers
+//! can filter ("is this the device I care about?") without keeping
+//! their own busid → vid/pid index from earlier `added` events. The
+//! Lima hostagent in particular wants to act on every removal of a
+//! configured device but ignore the rest, and busid alone makes that
+//! distinction impossible.
 //!
 //! # Subscription model
 //!
@@ -49,7 +56,28 @@ use tracing::{debug, info, warn};
 #[serde(tag = "event", rename_all = "snake_case")]
 pub enum EventLine {
     Added(AddedDevice),
-    Removed { busid: String },
+    Removed(RemovedDevice),
+}
+
+/// Minimal device identity carried by `removed` events. Just enough
+/// for a consumer to decide whether the removal concerns them; the
+/// richer metadata fields (manufacturer/product/serial) are dropped
+/// because they're informational, not used for filtering.
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct RemovedDevice {
+    pub busid: String,
+    pub vendor_id: String,
+    pub product_id: String,
+}
+
+impl From<&AddedDevice> for RemovedDevice {
+    fn from(a: &AddedDevice) -> Self {
+        Self {
+            busid: a.busid.clone(),
+            vendor_id: a.vendor_id.clone(),
+            product_id: a.product_id.clone(),
+        }
+    }
 }
 
 /// Projection of a [`host_mac::UsbDevice`] suitable for the wire.
@@ -102,16 +130,16 @@ pub fn encode_line(ev: &EventLine) -> String {
 }
 
 /// Maps an opaque hotplug `Id` (`nusb::DeviceId` in production) to the
-/// busid we previously emitted for it.
+/// `RemovedDevice` we previously emitted as `added` for it.
 ///
 /// `nusb::HotplugEvent::Disconnected` carries only a `DeviceId`, so we
-/// must remember the busid we assigned at `Connected` time to be able
-/// to emit a meaningful removal event. Kept purely synchronous and
-/// generic over the id type so it can be unit-tested with primitive
-/// integers, without spinning up a real USB stack.
+/// must remember the device identity we assigned at `Connected` time
+/// to be able to emit a meaningful `removed` event. Kept purely
+/// synchronous and generic over the id type so it can be unit-tested
+/// with primitive integers, without spinning up a real USB stack.
 #[derive(Debug)]
 pub struct IdMap<Id: Eq + Hash> {
-    by_id: HashMap<Id, String>,
+    by_id: HashMap<Id, RemovedDevice>,
 }
 
 impl<Id: Eq + Hash> Default for IdMap<Id> {
@@ -127,18 +155,18 @@ impl<Id: Eq + Hash> IdMap<Id> {
         Self::default()
     }
 
-    pub fn note_added(&mut self, id: Id, busid: String) {
-        self.by_id.insert(id, busid);
+    pub fn note_added(&mut self, id: Id, dev: RemovedDevice) {
+        self.by_id.insert(id, dev);
     }
 
-    /// Look up and forget the busid associated with this id.
+    /// Look up and forget the device associated with this id.
     ///
     /// Returns `None` for unknown ids (e.g. a `Disconnected` for a
     /// device the daemon never saw `Connected`, which can happen if
     /// the device was unplugged in the window between the initial
     /// `list_devices` snapshot and `watch_devices` taking effect).
     /// Callers must treat unknown removals as a no-op, not an error.
-    pub fn note_removed(&mut self, id: &Id) -> Option<String> {
+    pub fn note_removed(&mut self, id: &Id) -> Option<RemovedDevice> {
         self.by_id.remove(id)
     }
 
@@ -185,9 +213,9 @@ impl Hub {
         let _ = self.tx.send(EventLine::Added(dev));
     }
 
-    pub async fn publish_removed(&self, busid: String) {
-        self.snapshot.lock().await.remove(&busid);
-        let _ = self.tx.send(EventLine::Removed { busid });
+    pub async fn publish_removed(&self, dev: RemovedDevice) {
+        self.snapshot.lock().await.remove(&dev.busid);
+        let _ = self.tx.send(EventLine::Removed(dev));
     }
 
     /// Current device set as `added` events. Order is unspecified.
@@ -331,7 +359,7 @@ async fn run_async(socket: PathBuf) -> Result<()> {
         let id = info.id();
         let dev = host_mac::UsbDevice::from_info(&info);
         let added = AddedDevice::from_host(&dev);
-        idmap.note_added(id, added.busid.clone());
+        idmap.note_added(id, RemovedDevice::from(&added));
         hub.publish_added(added).await;
     }
 
@@ -347,12 +375,12 @@ async fn run_async(socket: PathBuf) -> Result<()> {
                     let id = info.id();
                     let dev = host_mac::UsbDevice::from_info(&info);
                     let added = AddedDevice::from_host(&dev);
-                    idmap.note_added(id, added.busid.clone());
+                    idmap.note_added(id, RemovedDevice::from(&added));
                     hub_for_pub.publish_added(added).await;
                 }
                 Some(nusb::hotplug::HotplugEvent::Disconnected(id)) => {
-                    if let Some(busid) = idmap.note_removed(&id) {
-                        hub_for_pub.publish_removed(busid).await;
+                    if let Some(removed) = idmap.note_removed(&id) {
+                        hub_for_pub.publish_removed(removed).await;
                     }
                 }
                 None => return,
@@ -423,32 +451,49 @@ mod tests {
             "manufacturer key present even when null"
         );
 
-        let removed_line = encode_line(&EventLine::Removed {
+        let removed_line = encode_line(&EventLine::Removed(RemovedDevice {
             busid: "02-3".into(),
-        });
+            vendor_id: "0001".into(),
+            product_id: "00ff".into(),
+        }));
         let parsed: serde_json::Value = serde_json::from_str(removed_line.trim_end()).unwrap();
         assert_eq!(parsed["event"], "removed");
         assert_eq!(parsed["busid"], "02-3");
+        assert_eq!(
+            parsed["vendor_id"], "0001",
+            "removed must carry vid for consumer-side filtering"
+        );
+        assert_eq!(parsed["product_id"], "00ff");
         assert!(
-            parsed.get("vendor_id").is_none(),
-            "removed events must not carry vendor metadata"
+            parsed.get("manufacturer").is_none(),
+            "removed events must not carry descriptive metadata"
         );
     }
 
     #[test]
     fn idmap_roundtrip_known_and_unknown() {
         let mut m: IdMap<u32> = IdMap::new();
-        m.note_added(7, "01-1".into());
-        m.note_added(9, "02-1".into());
+        let d1 = RemovedDevice {
+            busid: "01-1".into(),
+            vendor_id: "1050".into(),
+            product_id: "0407".into(),
+        };
+        let d2 = RemovedDevice {
+            busid: "02-1".into(),
+            vendor_id: "0781".into(),
+            product_id: "5530".into(),
+        };
+        m.note_added(7, d1.clone());
+        m.note_added(9, d2.clone());
         assert_eq!(m.len(), 2);
-        assert_eq!(m.note_removed(&7).as_deref(), Some("01-1"));
+        assert_eq!(m.note_removed(&7), Some(d1));
         assert_eq!(m.len(), 1);
         // Same id again: drops to None (we forgot it on first removal).
         assert!(m.note_removed(&7).is_none());
         // Unknown id: None, not panic.
         assert!(m.note_removed(&12345).is_none());
         // Other entry still there.
-        assert_eq!(m.note_removed(&9).as_deref(), Some("02-1"));
+        assert_eq!(m.note_removed(&9), Some(d2));
     }
 
     /// End-to-end exercise of `Hub` + `accept_loop` + `serve_subscriber`
@@ -502,7 +547,12 @@ mod tests {
         assert_eq!(v["busid"], "02-1");
 
         // Removal of the first device.
-        hub.publish_removed("01-1".into()).await;
+        hub.publish_removed(RemovedDevice {
+            busid: "01-1".into(),
+            vendor_id: "1050".into(),
+            product_id: "0407".into(),
+        })
+        .await;
         line.clear();
         timeout(Duration::from_secs(2), reader.read_line(&mut line))
             .await
@@ -511,6 +561,7 @@ mod tests {
         let v: serde_json::Value = serde_json::from_str(line.trim_end()).unwrap();
         assert_eq!(v["event"], "removed");
         assert_eq!(v["busid"], "01-1");
+        assert_eq!(v["vendor_id"], "1050");
 
         // Second subscriber should see the *current* snapshot (just 02-1),
         // not the already-removed 01-1.
