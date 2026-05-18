@@ -600,7 +600,10 @@ async fn handle_cmd_submit(
     let dir_in = basic.direction == USBIP_DIR_IN;
     let tbl = usize::try_from(cmd.transfer_buffer_length).unwrap_or(0);
     debug!(
-        seqnum = basic.seqnum, ep = basic.ep, dir_in, tbl,
+        seqnum = basic.seqnum,
+        ep = basic.ep,
+        dir_in,
+        tbl,
         setup = format!("{:02x?}", cmd.setup),
         "CMD_SUBMIT received"
     );
@@ -798,7 +801,14 @@ async fn run_submit(
     };
     let mut out = Vec::with_capacity(URB_HEADER_SIZE + payload.len());
     write_ret_submit(&mut out, seqnum, &ret, &payload);
-    debug!(seqnum, ep, status, actual_length, payload_len = payload.len(), "sending RET_SUBMIT");
+    debug!(
+        seqnum,
+        ep,
+        status,
+        actual_length,
+        payload_len = payload.len(),
+        "sending RET_SUBMIT"
+    );
     if let Err(e) = writer.lock().await.write_all(&out).await {
         debug!(seqnum, error = %e, "client write failed; closing");
     }
