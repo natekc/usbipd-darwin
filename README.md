@@ -187,6 +187,7 @@ The canonical deployment pattern (matching what Lima already does for
 - [CONTRIBUTING.md](CONTRIBUTING.md) — scope, dev workflow, release process.
 - [SECURITY.md](SECURITY.md) — threat model and how to report vulnerabilities privately.
 - [CHANGELOG.md](CHANGELOG.md) — release notes.
+- [docs/cli.md](docs/cli.md) — every `--help` page in one file.
 
 ## License
 

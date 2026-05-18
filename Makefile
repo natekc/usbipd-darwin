@@ -21,7 +21,7 @@ PLIST         := dist/launchd/$(LAUNCHD_LABEL).plist
 
 SIGN_ID       ?= -            # `-` means ad-hoc; override for distribution
 
-.PHONY: build codesign install uninstall notarize clean
+.PHONY: build codesign install uninstall notarize docs clean
 
 build:
 	$(CARGO) build --release
@@ -57,6 +57,32 @@ notarize: codesign
 	xcrun notarytool submit $(TARGET_DIR)/usbipd.zip \
 		--keychain-profile "$(NOTARY_PROFILE)" \
 		--wait
+
+# Regenerate docs/cli.md by capturing `--help` for every subcommand.
+# Maintainers should `make docs && git add docs/cli.md` whenever they
+# touch CLI surface.
+docs: build
+	@mkdir -p docs
+	@{ \
+		echo '# usbipd CLI reference'; \
+		echo; \
+		echo '_Auto-generated from `usbipd --help`. Regenerate with `make docs`._'; \
+		echo; \
+		echo '## `usbipd`'; \
+		echo; \
+		echo '```'; \
+		$(RELEASE_BIN) --help; \
+		echo '```'; \
+		for sub in list daemon events sudoers release-capture; do \
+			echo; \
+			echo "## \`usbipd $$sub\`"; \
+			echo; \
+			echo '```'; \
+			$(RELEASE_BIN) $$sub --help 2>&1; \
+			echo '```'; \
+		done; \
+	} > docs/cli.md
+	@echo "Wrote docs/cli.md"
 
 clean:
 	$(CARGO) clean
