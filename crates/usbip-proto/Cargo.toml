@@ -12,7 +12,9 @@ description = "USB/IP wire protocol codec"
 thiserror = { workspace = true }
 
 [dev-dependencies]
-criterion = { version = "0.5", default-features = false, features = ["html_reports"] }
+criterion = { version = "0.5", default-features = false, features = [
+  "html_reports",
+] }
 
 [[bench]]
 name = "codec"

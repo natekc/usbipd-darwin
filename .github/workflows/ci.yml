@@ -28,6 +28,16 @@ jobs:
       - run: cargo test --all-features
       - run: cargo build --release
 
+  taplo:
+    name: taplo fmt (TOML)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: uncenter/setup-taplo@v1
+        with:
+          version: '0.9.3'
+      - run: taplo fmt --check --diff
+
   deny:
     name: cargo-deny (advisories + licenses + sources)
     runs-on: ubuntu-latest

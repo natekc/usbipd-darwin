@@ -1,13 +1,7 @@
 [workspace]
 resolver = "3"
-members = [
-    "crates/usbip-proto",
-    "crates/host-mac",
-    "crates/usbipd",
-]
-exclude = [
-    "crates/usbip-proto/fuzz",
-]
+members = ["crates/usbip-proto", "crates/host-mac", "crates/usbipd"]
+exclude = ["crates/usbip-proto/fuzz"]
 
 [workspace.package]
 version = "0.0.1"
@@ -31,20 +25,28 @@ unnecessary_wraps = "allow"
 
 [workspace.dependencies]
 # Internal crates
-usbip-proto  = { path = "crates/usbip-proto",  version = "0.0.1" }
-host-mac     = { path = "crates/host-mac",     version = "0.0.1" }
+usbip-proto = { path = "crates/usbip-proto", version = "0.0.1" }
+host-mac = { path = "crates/host-mac", version = "0.0.1" }
 
 # External
-anyhow      = "1"
-thiserror   = "2"
-bytes       = "1"
-clap        = { version = "4", features = ["derive"] }
-tokio       = { version = "1", features = ["rt-multi-thread", "macros", "net", "io-util", "signal", "sync", "time"] }
-tracing     = "0.1"
+anyhow = "1"
+thiserror = "2"
+bytes = "1"
+clap = { version = "4", features = ["derive"] }
+tokio = { version = "1", features = [
+  "rt-multi-thread",
+  "macros",
+  "net",
+  "io-util",
+  "signal",
+  "sync",
+  "time",
+] }
+tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
-nusb        = "0.2"
-serde       = { version = "1", features = ["derive"] }
-serde_json  = "1"
+nusb = "0.2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
 # Only the `Stream` trait is needed (to poll `nusb::HotplugWatch`); the
 # heavier `futures` umbrella crate is intentionally avoided.
 futures-core = "0.3"

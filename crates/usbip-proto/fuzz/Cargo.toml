@@ -17,26 +17,26 @@ usbip-proto = { path = ".." }
 name = "op_header"
 path = "fuzz_targets/op_header.rs"
 test = false
-doc  = false
+doc = false
 bench = false
 
 [[bin]]
 name = "cmd_submit"
 path = "fuzz_targets/cmd_submit.rs"
 test = false
-doc  = false
+doc = false
 bench = false
 
 [[bin]]
 name = "urb_header"
 path = "fuzz_targets/urb_header.rs"
 test = false
-doc  = false
+doc = false
 bench = false
 
 [[bin]]
 name = "req_import_busid"
 path = "fuzz_targets/req_import_busid.rs"
 test = false
-doc  = false
+doc = false
 bench = false
