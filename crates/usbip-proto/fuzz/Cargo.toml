@@ -4,6 +4,13 @@ version = "0.0.0"
 publish = false
 edition = "2024"
 
+# Standalone — not part of the main workspace (cargo-fuzz needs
+# nightly + custom RUSTFLAGS). The parent Cargo.toml lists this
+# directory in `workspace.exclude`; this empty [workspace] table
+# is the cargo-fuzz convention so `cargo` invocations from inside
+# this directory don't try to inherit the parent.
+[workspace]
+
 [package.metadata]
 cargo-fuzz = true
 
