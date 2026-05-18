@@ -27,3 +27,13 @@ jobs:
       - run: cargo clippy --all-targets --all-features
       - run: cargo test --all-features
       - run: cargo build --release
+
+  deny:
+    name: cargo-deny (advisories + licenses + sources)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: EmbarkStudios/cargo-deny-action@v2
+        with:
+          command: check advisories licenses sources bans
+          arg: --all-features
