@@ -2,7 +2,9 @@
 
 A macOS USB/IP server implementation in Rust, intended for use by [Lima](https://github.com/lima-vm/lima) and other VMMs that need to expose host USB devices to Linux guests.
 
-> **Status:** MVP-5 — full protocol implementation plus IOKit force-capture, so Linux clients can `usbip list -r`, `usbip attach`, and use any USB device class end-to-end (mass storage, HID, CDC, printer, audio, …). Verified with a USB HID keyboard: both interfaces bind to `usbhid` on the guest, full input event chain works.
+> **Status:** public preview (`0.1.x`). Full wire-protocol implementation plus IOKit force-capture, so Linux clients can `usbip list -r`, `usbip attach`, and use any USB device class end-to-end (mass storage, HID, CDC, printer, audio, …). Verified on macOS 14 and 15 with HID, mass-storage, and CDC devices against a Lima Linux guest. Wire protocol and `usbipd` CLI surface should not break in patch releases; pre-1.0, expect occasional minor-version breaking changes — see [CHANGELOG.md](CHANGELOG.md).
+
+**MSRV:** Rust 1.85 (edition 2024).
 
 ## Why another macOS USB/IP daemon?
 
@@ -43,9 +45,35 @@ This is why the daemon ships with a sudoers.d snippet rather than a launchd plis
 ```
 crates/
 ├── usbip-proto/    # USB/IP wire protocol (no_std-friendly codec)
-├── host-mac/       # nusb-backed USB enumeration and device claim
-├── usbip-server/   # transport-agnostic server state machine
-└── usbipd/         # the `usbipd` binary
+├── host-mac/       # nusb-backed USB enumeration + IOKit force-capture
+└── usbipd/         # the `usbipd` binary (transport, policy, server loop)
+```
+
+## Install
+
+### Homebrew (recommended)
+
+```sh
+brew tap lima-vm/usbipd-darwin https://github.com/lima-vm/usbipd-darwin
+brew install usbipd-darwin
+```
+
+The formula installs a signed, notarized binary plus a sample `sudoers.d`
+snippet and launchd plist under `$(brew --prefix)/share/usbipd-darwin/`.
+
+### From source
+
+```sh
+git clone https://github.com/lima-vm/usbipd-darwin
+cd usbipd-darwin
+make build              # or: cargo build --release
+sudo make install       # /usr/local/bin/usbipd + sample launchd plist
+```
+
+Or without cloning:
+
+```sh
+cargo install --git https://github.com/lima-vm/usbipd-darwin usbipd
 ```
 
 ## Quick start
@@ -153,6 +181,12 @@ The canonical deployment pattern (matching what Lima already does for
 %admin ALL=(ALL) NOPASSWD: /usr/local/bin/usbipd daemon *
 %admin ALL=(ALL) NOPASSWD: /usr/local/bin/usbipd release-capture *
 ```
+
+## Contributing & security
+
+- [CONTRIBUTING.md](CONTRIBUTING.md) — scope, dev workflow, release process.
+- [SECURITY.md](SECURITY.md) — threat model and how to report vulnerabilities privately.
+- [CHANGELOG.md](CHANGELOG.md) — release notes.
 
 ## License
 
