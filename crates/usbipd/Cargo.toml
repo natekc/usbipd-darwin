@@ -29,6 +29,7 @@ futures-core       = { workspace = true }
 
 [dev-dependencies]
 tempfile = "3"
+usbip-proto = { workspace = true }
 
 [lints]
 workspace = true
