@@ -1,6 +1,8 @@
 # usbipd-darwin
 
-A macOS USB/IP server implementation in Rust, intended for use by [Lima](https://github.com/lima-vm/lima) and other VMMs that need to expose host USB devices to Linux guests.
+A USB/IP server for **macOS** (Apple Silicon and Intel), written in Rust. Intended for use by [Lima](https://github.com/lima-vm/lima) and other VMMs that need to expose host USB devices to Linux guests.
+
+The `-darwin` suffix mirrors the Rust target triple (`*-apple-darwin`) and the convention set by `usbipd-win`; this project does **not** target iOS or any other Darwin-based OS, only macOS.
 
 > **Status:** public preview (`0.1.x`). Full wire-protocol implementation plus IOKit force-capture, so Linux clients can `usbip list -r`, `usbip attach`, and use any USB device class end-to-end (mass storage, HID, CDC, printer, audio, …). Verified on macOS 14 and 15 with HID, mass-storage, and CDC devices against a Lima Linux guest. Wire protocol and `usbipd` CLI surface should not break in patch releases; pre-1.0, expect occasional minor-version breaking changes — see [CHANGELOG.md](CHANGELOG.md).
 
